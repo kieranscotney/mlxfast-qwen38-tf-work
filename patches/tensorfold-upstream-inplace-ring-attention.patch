@@ -1,0 +1,68 @@
+From 5fcd0908eaa78e7d800f129d52ce26e29f9f5438 Mon Sep 17 00:00:00 2001
+From: kieranscotney <kieranscotney@gmail.com>
+Date: Fri, 30 Oct 2026 23:27:39 +0000
+Subject: [PATCH] qwen27 DFlash draft: attend the rolling K/V cache in place
+ when it does not wrap
+
+attendRows copied the drafter's whole sliding-window K and V into scratch
+tensors (gather) for every draft layer in every round, then appended the
+query rows' own keys and values behind them. The cache holds window + 16 rows.
+When the context does not wrap (begin % window + context_rows <= window) its
+keys and values already stand contiguously in the cache, and the slots behind
+it are free (live slots are exactly the context's). The query rows' own keys
+and values now go in those slots and attention runs over the cache itself.
+A wrapping context, or rows that would not fit within window + 16 slots,
+takes the unchanged gather path.
+
+The attention kernels, mask, scale and key order are unchanged, so scores,
+candidates and the chosen draft token are bit-identical; the target still
+verifies every drafted token. Scratch slots are past the live context and are
+overwritten by the next round's committed appends, which are encoded before
+that round's attention.
+
+Measured on an M5 Max (Qwen3.8-27B-MLX-4bit, DFlash2 drafter, depth 1, public
+long-copy gate, alternating runs): drafter proposal 4.60 -> 4.47 ms per round,
+decode +0.4% to +0.6% depending on the surrounding stack, prefill unchanged.
+A rolling hash over every drafted and emitted token matches the unmodified
+build round for round up to position ~2,009, and the exact-token gate passes
+past the 2,048-slot window boundary.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ .../qwen27/dflash/runtime_context.zig         | 23 ++++++++++++++-----
+ 1 file changed, 17 insertions(+), 6 deletions(-)
+
+diff --git a/zig/src/families/qwen27/dflash/runtime_context.zig b/zig/src/families/qwen27/dflash/runtime_context.zig
+index 1e062ac0..731d0208 100644
+--- a/zig/src/families/qwen27/dflash/runtime_context.zig
++++ b/zig/src/families/qwen27/dflash/runtime_context.zig
+@@ -110,12 +110,23 @@ pub fn attention(ptr: *anyopaque, epoch: u64, p: op.Attention) !op.View {
+ fn attendRows(b: *Backend, e: @import("metal").ComputeEncoder, p: op.Attention, context: op.Context, caches: []const @import("runtime_backend.zig").Cache, first: u32, rows: u32, result: op.View) !void {
+     const context_rows: u32 = @intCast(context.end - context.begin);
+     const keys = context_rows + rows;
+-    const merged_k = try b.frame.alloc(keys, b.config.kvWidth(), .bf16);
+-    const merged_v = try b.frame.alloc(keys, b.config.kvWidth(), .bf16);
+-    const k = try b.frame.ref(merged_k);
+-    const v = try b.frame.ref(merged_v);
+-    try gather(b, e, context, caches[p.layer].keys, k);
+-    try gather(b, e, context, caches[p.layer].values, v);
++    // The context is contiguous in the ring when it does not wrap, and the cache holds 16 rows past the window: the
++    // query rows' own keys and values then go in the free slots after it and attention reads the cache in place.
++    const at: u32 = @intCast(context.begin % b.config.window);
++    const in_place = at + context_rows <= b.config.window and at + keys <= b.config.window + 16;
++    var k: Ref = undefined;
++    var v: Ref = undefined;
++    if (in_place) {
++        k = .{ .buf = caches[p.layer].keys, .off = @as(usize, at) * b.config.kvWidth() * 2 };
++        v = .{ .buf = caches[p.layer].values, .off = @as(usize, at) * b.config.kvWidth() * 2 };
++    } else {
++        const merged_k = try b.frame.alloc(keys, b.config.kvWidth(), .bf16);
++        const merged_v = try b.frame.alloc(keys, b.config.kvWidth(), .bf16);
++        k = try b.frame.ref(merged_k);
++        v = try b.frame.ref(merged_v);
++        try gather(b, e, context, caches[p.layer].keys, k);
++        try gather(b, e, context, caches[p.layer].values, v);
++    }
+     const off = @as(usize, context_rows) * b.config.kvWidth() * 2;
+     const own_k = try b.frame.ref(p.keys);
+     const own_v = try b.frame.ref(p.values);
