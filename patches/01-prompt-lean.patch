@@ -1,0 +1,23 @@
+diff --git a/zig/src/families/qwen27/quant_gpu.zig b/zig/src/families/qwen27/quant_gpu.zig
+index 9b56cdc..365cdbf 100644
+--- a/zig/src/families/qwen27/quant_gpu.zig
++++ b/zig/src/families/qwen27/quant_gpu.zig
+@@ -226,7 +226,8 @@ pub const Kernels = struct {
+         rows: u32,
+     ) !std.AutoHashMapUnmanaged(Key, lane.Projection).GetOrPutResult {
+         const reg = p.bits == 4 and p.group == 64;
+-        // decoded rows (a verify's 2, a serial step's 1) take the reg kernel without each lane's padding row
++        // decoded rows (a verify's 2, a serial step's 1) take the reg kernel without each lane's padding row;
++        // prompt rows also take the lean prefetch (codes only in flight, metadata and sums loaded in their own group)
+         const key = Key{
+             .kind = .projection,
+             .n = p.n,
+@@ -237,7 +238,7 @@ pub const Kernels = struct {
+             .bits = p.bits,
+             .group = p.group,
+             .rows8 = reg and !k.prompt and rows <= 8,
+-            .lean = reg and !k.prompt,
++            .lean = reg,
+         };
+         const half = p.n / 64;
+         const ranges = [_][2]usize{ .{ skip, half - skip }, .{ half + skip, half - skip } };

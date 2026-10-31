@@ -1,0 +1,157 @@
+diff --git a/zig/kernels/metal/core/deltanet_slots.metal b/zig/kernels/metal/core/deltanet_slots.metal
+index 7ed667e..6bb2e0b 100644
+--- a/zig/kernels/metal/core/deltanet_slots.metal
++++ b/zig/kernels/metal/core/deltanet_slots.metal
+@@ -122,6 +122,44 @@ kernel void tf_delta_gdn_tree_pair(device const bfloat* query [[buffer(0)]],
+       advanced[at + p.dk] = last1[part];
+     }
+ }
++// A depth-one star (row 0 from the root, every other row a child of row 0) for two adjacent value columns a simdgroup:
++// each row's update and read are tree_pair's on the same state; independent children run two at a time.
++kernel void tf_delta_gdn_star(device const bfloat* query [[buffer(0)]],
++                         device const bfloat* key [[buffer(1)]],
++                         device const bfloat* value [[buffer(2)]],
++                         device const float* decay [[buffer(3)]],
++                         device const bfloat* mixing [[buffer(4)]],
++                         device const float* committed [[buffer(5)]],
++                         device const int* parents [[buffer(6)]],
++                         device const TfDeltaSegment* segments [[buffer(7)]],
++                         constant TfDeltaParams& p [[buffer(8)]],
++                         device bfloat* output [[buffer(9)]],
++                         device float* snapshots [[buffer(10)]],
++                         device const TfDeltaSlotStep* steps [[buffer(11)]],
++                         uint3 position [[thread_position_in_grid]],
++                         uint lane [[thread_index_in_simdgroup]]) {
++  const uint segment_index = position.z / p.nv, head = position.z % p.nv;
++  const uint dimension = position.y * 2, key_head = head / (p.nv / p.nk);
++  const TfDeltaSegment span = segments[segment_index];
++  const uint state_stride = p.nv * p.dv * p.dk;
++  const uint column = (head * p.dv + dimension) * p.dk + lane * 4;
++  float4 s0, s1;
++  for (uint part = 0; part < 4; ++part) {
++    s0[part] = committed[span.state_slot * state_stride + column + part];
++    s1[part] = committed[span.state_slot * state_stride + column + p.dk + part];
++  }
++  tf_delta_tree_node2(s0, s1, query, key, value, decay, mixing, p, output, steps[span.first].row, head, key_head, dimension, lane);
++  uint at = 1;
++  for (; at + 1 < span.rows; at += 2) {
++    float4 a0 = s0, a1 = s1, b0 = s0, b1 = s1;
++    tf_delta_tree_node2(a0, a1, query, key, value, decay, mixing, p, output, steps[span.first + at].row, head, key_head, dimension, lane);
++    tf_delta_tree_node2(b0, b1, query, key, value, decay, mixing, p, output, steps[span.first + at + 1].row, head, key_head, dimension, lane);
++  }
++  if (at < span.rows) {
++    float4 a0 = s0, a1 = s1;
++    tf_delta_tree_node2(a0, a1, query, key, value, decay, mixing, p, output, steps[span.first + at].row, head, key_head, dimension, lane);
++  }
++}
+ #define TF_TREE_SLOTS(N) template [[host_name("tf_delta_gdn_tree_slots_" #N)]] kernel void tf_delta_gdn_tree_slots<N>(device const bfloat*, device const bfloat*, device const bfloat*, device const float*, device const bfloat*, device const float*, device const int*, device const TfDeltaSegment*, constant TfDeltaParams&, device bfloat*, device float*, device const TfDeltaSlotStep*, device float*, device float*, uint3, uint);
+ TF_TREE_SLOTS(1)
+ TF_TREE_SLOTS(2)
+diff --git a/zig/src/core/deltanet_kernels.zig b/zig/src/core/deltanet_kernels.zig
+index c36124f..33bc631 100644
+--- a/zig/src/core/deltanet_kernels.zig
++++ b/zig/src/core/deltanet_kernels.zig
+@@ -44,6 +44,8 @@ pub const Kernels = struct {
+     post_rows: metal.Pipeline,
+     /// tf_delta_gdn_tree_slots<1> for two adjacent value columns a simdgroup (a chain's verify).
+     tree_pair: metal.Pipeline,
++    /// tf_delta_gdn_star: a depth-one star's rows on tree_pair's two-column layout.
++    star: metal.Pipeline,
+ 
+     pub fn init(device: metal.Device) !Kernels {
+         const library = try metal.Library.fromSource(device, source.core_deltanet, metal.CompileOptions.mlx());
+@@ -70,6 +72,7 @@ pub const Kernels = struct {
+             "tree_slots_8",
+             "tree_slots_16",
+             "tree_pair",
++            "star",
+         };
+         var pipelines: [names.len]metal.Pipeline = undefined;
+         var done: usize = 0;
+@@ -100,6 +103,7 @@ pub const Kernels = struct {
+             .pre_rows = pipelines[13],
+             .post_rows = pipelines[14],
+             .tree_pair = pipelines[20],
++            .star = pipelines[21],
+         };
+     }
+ 
+@@ -121,6 +125,7 @@ pub const Kernels = struct {
+             k.pre_rows,
+             k.post_rows,
+             k.tree_pair,
++            k.star,
+         }) |p| p.deinit();
+         for (k.pipelines.tree_slots) |p| p.deinit();
+         k.library.deinit();
+diff --git a/zig/src/families/qwen27/gdn.zig b/zig/src/families/qwen27/gdn.zig
+index d1cb18a..c90470f 100644
+--- a/zig/src/families/qwen27/gdn.zig
++++ b/zig/src/families/qwen27/gdn.zig
+@@ -112,6 +112,7 @@ pub const Round = struct {
+     sums: ?Sums = null,
+     compact: bool,
+     slot_kernel: usize, // which tree_slots kernel holds the plan's peak of live states
++    star: bool = false, // one segment: row 0 from the root, every later row a child of row 0, nothing written back
+ 
+     pub fn init(shape: abi.Shape, kinds: abi.WeightKinds, p: abi.Params, plan: Plan, b: Buffers, pipelines: Pipelines) !Round {
+         if (plan.parents.len != p.rows or plan.segments.len == 0 or plan.keeps.len != plan.segments.len or (plan.compact and plan.slot_steps.len != p.rows)) return error.BadGdnPlan;
+@@ -162,6 +163,21 @@ pub const Round = struct {
+ 
+     /// forward, a chain's one-slot tree (tf_delta_gdn_tree_pair) taking two value columns a simdgroup.
+     pub fn forwardPair(r: Round, e: metal.ComputeEncoder, pair: metal.Pipeline, post_rows: metal.Pipeline) void {
++        return r.forwardPairStar(e, pair, null, post_rows);
++    }
++    /// forwardPair; a star round (Round.star) takes tf_delta_gdn_star instead of its tree_slots kernel.
++    pub fn forwardPairStar(r: Round, e: metal.ComputeEncoder, pair: metal.Pipeline, star: ?metal.Pipeline, post_rows: metal.Pipeline) void {
++        if (star) |sp| if (r.star and r.usesSlots() and r.p.dv % 2 == 0 and r.p.advance == 0) {
++            e.setPipeline(sp);
++            bind(e, .{ r.b.query, r.b.key, r.b.value, r.b.decay, r.b.mixing, r.b.state, r.b.parents, r.b.segments }, 0);
++            e.setValue(r.p, 8);
++            bind(e, .{ r.b.recurrent, r.b.snapshots }, 9);
++            r.b.slot_steps.bind(e, 11);
++            e.dispatchThreads(.{ .width = 32, .height = r.p.dv / 2, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = 4, .depth = 1 });
++            e.barrier();
++            r.gate(e, post_rows);
++            return;
++        };
+         if (!r.usesSlots() or r.slot_kernel != 0 or r.p.dv % 2 != 0) return r.forward(e, post_rows);
+         e.setPipeline(pair);
+         bind(e, .{ r.b.query, r.b.key, r.b.value, r.b.decay, r.b.mixing, r.b.state, r.b.parents, r.b.segments }, 0);
+diff --git a/zig/src/families/qwen27/gdn_pool_gpu.zig b/zig/src/families/qwen27/gdn_pool_gpu.zig
+index 8cbc280..31869e7 100644
+--- a/zig/src/families/qwen27/gdn_pool_gpu.zig
++++ b/zig/src/families/qwen27/gdn_pool_gpu.zig
+@@ -158,7 +158,7 @@ pub const Pool = struct {
+         prepared.prepareRows(pre.encoder, pool.kernels.pre_rows);
+         try pre.end();
+         var scan = profile.begin(pool.profiler, e, .gdn_scan);
+-        prepared.forwardPair(scan.encoder, pool.kernels.tree_pair, pool.kernels.post_rows);
++        prepared.forwardPairStar(scan.encoder, pool.kernels.tree_pair, pool.kernels.star, pool.kernels.post_rows);
+         try scan.end();
+     }
+ 
+@@ -335,6 +335,7 @@ pub const Pool = struct {
+         var result = try gdn.Round.init(pool.budget.shape, refs.scalars.kinds, p, plan, b, pool.kernels.pipelines);
+         result.tree_mode = pool.tree_mode;
+         result.p.advance = @intFromBool(pool.advances(plan));
++        result.star = isStar(plan);
+         if (refs.sums) |w| {
+             // one fp32 sum per 64-value group of each row, `stride` rows a group (tf_lane_sums' layout)
+             const groups = pool.budget.shape.value / 64;
+@@ -402,3 +403,15 @@ fn refSpan(r: Ref, bytes: usize) !gdn.Span {
+     if (r.offset > r.buffer.length() or bytes > r.buffer.length() - r.offset) return error.BadGdnBuffer;
+     return .{ .buffer = r.buffer, .offset = r.offset, .bytes = bytes };
+ }
++
++
++/// One compact segment of three or more rows: row 0 from the root, then children of row 0 only, in row order.
++fn isStar(plan: Plan) bool {
++    if (!plan.compact or plan.segments.len != 1 or plan.parents.len < 3 or plan.slot_steps.len != plan.parents.len) return false;
++    const seg = plan.segments[0];
++    if (seg.first != 0 or seg.rows != plan.parents.len) return false;
++    for (plan.parents, plan.slot_steps, 0..) |parent, step, row| {
++        if (parent != (if (row == 0) @as(i32, -1) else 0) or step.row != row) return false;
++    }
++    return true;
++}

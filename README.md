@@ -1,49 +1,73 @@
 # mlx.fast Qwen3.8-27B on TensorFold: optimisation work
 
 Work by Kieran Scotney on the [Yukon](https://www.yukon.org/mlxfast?benchmark=qwen38-27b-tf&platform=mlx) mlx.fast
-challenge for [TensorFold](https://github.com/ashhart/TensorFold): make Qwen3.8-27B (4-bit MLX, with the DFlash2 drafter at
-depth 1) decode and prefill faster on an Apple M5 Max, with the target's output bit-exact.
+challenge `GumbiiDigital/mlxfast-qwen38-27b-tf` for [TensorFold](https://github.com/ashhart/TensorFold): make Qwen3.8-27B
+(4-bit MLX, DFlash2 drafter at depth 1) prefill and decode faster on an Apple M5 Max, with the target's output token-for-token exact.
 
-Done with Claude Code (Claude Sonnet 5.5). All engine code this builds on is public; see Attribution.
+Done with Claude Code (Claude Sonnet 5.5 on 30 Oct, Claude Opus 5.5 from 31 Oct). All engine code this builds on is public; see Attribution.
 
-## The contribution: in-place ring-cache attention for the DFlash drafter
+**Headline:** submission [`07fd50da`](notes/yukon-submission-07fd50da-note.md) was **promoted** at 1.63957
+(+76 bps over the previous leader). Three earlier finds (prompt lean, prompt-row SwiGLU, one-pass drafter catch-up) were
+carried, with credit, in leader `2c41feb1` and every leader after it.
 
-`attendRows` in `zig/src/families/qwen27/dflash/runtime_context.zig` used to gather the drafter's whole sliding-window K/V
-into scratch for every draft layer, every round. When the context does not wrap, it already stands contiguously in the
-cache (which holds `window + 16` rows), so the query rows' own K/V are written into the free slots behind it and attention
-reads the cache in place. A wrapping context takes the unchanged gather path. The kernels, mask, scale and key order are
-unchanged, so the draft is bit-identical and the target still verifies every token.
+## My finds
 
-- Drafter proposal: 4.60 ms to 4.47 ms per round (M5 Max).
-- Decode: about +0.5% locally, prefill unchanged.
-- Checked: a rolling hash of every drafted and emitted token matches the unmodified build round for round, and the
-  exact-token gate passes past the 2,048-slot window boundary.
+Patches are relative to the TensorFold root (`zig/...`) and apply to the base submission listed. The same patches, one commit
+each, are on the [`yukon-qwen38-finds` branch](https://github.com/kieranscotney/TensorFold/tree/yukon-qwen38-finds/yukon/qwen38-27b-tf)
+of my TensorFold fork.
 
-Patches:
+| # | Find | Base | Local effect | Official |
+|---|---|---|---|---|
+| A | In-place ring-cache attention for the drafter ([patch](patches/tensorfold-upstream-inplace-ring-attention.patch)) | 0231208a | drafter 4.60 → 4.47 ms, dec +0.5% | merged upstream, ashhart/TensorFold#1727 |
+| B | Drafter head lane pipeline compiled at load | ff408317 | first draft round 190 → 29 ms on a loaded machine, dec +0.75% | ashhart/TensorFold#1734 |
+| 1 | Prompt projections take the lean prefetch ([patch](patches/01-prompt-lean.patch)) | 2d06a685 | pf +2.5% | in `ea8f8271` 1.37849; carried in leaders |
+| 2 | Prompt-row SwiGLU in the gate/up epilogue ([patch](patches/02-prompt-row-swiglu.patch)) | e75967a0 | pf +2.1% | in `23d85725` 1.52942; carried in leaders |
+| 3 | Drafter catches up on a prompt in 1024-row passes ([patch](patches/03-drafter-flush-1024.patch)) | 5317b10e | dec window +0.15% | in `f3f8f654` 1.38132; carried in leaders |
+| 4 | Drafter top-k as a SIMD-shuffle tournament ([patch](patches/04-drafter-simd-topk.patch)) | 38c11ee6 | small, exact | in promoted `07fd50da` |
+| 5 | Two-tile prompt inputs for the mixer projections ([patch](patches/05-two-tile-prompt-inputs.patch)) | 38c11ee6 | prompt GPU −10.2 ms, pf +0.95% | **promoted** `07fd50da` 1.63957 |
+| 6 | Depth-one star GDN verify kernel ([patch](patches/06-gdn-star-verify.patch)) | 7edba466 | 8-row verify −0.31 ms, dec +0.05% | not submitted; same idea by ArthurOstapenko scored +0.45% |
 
-- [`patches/tensorfold-upstream-inplace-ring-attention.patch`](patches/tensorfold-upstream-inplace-ring-attention.patch):
-  against upstream TensorFold `main` (`01e25d3a`), `git am` format, with a CHANGELOG entry. `zig build test -Dcpu=apple_m1` exits 0.
-- [`patches/challenge-inplace-ring-attention.patch`](patches/challenge-inplace-ring-attention.patch): the same change
-  against the Yukon challenge tree.
-- [`notes/upstream-pr.md`](notes/upstream-pr.md): the pull-request text.
+Notes on what each one changes:
 
-## Yukon result
+1. `Key.lean` went from `reg and !k.prompt` to `reg`, so prompt-row reg projections use kshitij-hash's codes-only prefetch
+   (`TF_REG_LEAN`) that decode already used. Exact by construction. No codes in flight loses 5.4%; two groups gains nothing.
+2. Extends fkiene's decode-only `TF_SWIGLU` fused epilogue to prompt rows (16-row blocks, split-K 1, row offsets) with the
+   same bf16 rounding and `h` expression, so it stays exact. The patch also carries the `prepareDecode` helper from B.
+3. The drafter absorbed a prompt's tap rows 128 at a time (nine frames and waits for 1065 tokens). Now 1024 per pass.
+4. Each rank's tournament runs inside a simdgroup with `simd_shuffle_xor`, leaving one threadgroup step per rank. Tapes identical.
+5. e-man07's generalised multi-tile prompt kernel (`e6c09968`), merged with `38c11ee6`'s fp16-subnormal unpack, applied to FFN
+   down and, my addition, to the 12288×5120 and 10240×5120 mixer inputs and the unfused prompt gate/up. **The patch carries
+   e-man07's kernel**; my part is the merge and the extra shapes.
+6. With sibling drafts at depth 1 the verify tree is a star. `tf_delta_gdn_star` pairs value columns per simdgroup and runs
+   independent children two at a time instead of the generic tree-slot path. Exact on 3×1024-token tapes.
 
-Submission `7ea68997` (terrapinelf's `0231208a` plus this change) scored **1.33430** officially, prefill +3.5%, decode +57.0%.
-It missed promotion by about 0.013%: `e836f316` (1.33447) had been promoted a few minutes earlier, and it contains the same
-in-place idea, found independently. See [`notes/yukon-submission-7ea68997-note.md`](notes/yukon-submission-7ea68997-note.md).
+## Measurement finds
 
-## What did not help (all bit-exact, measured with alternating runs)
+The full write-up, with a table of 22 dead ends, is in [`notes/measurements.md`](notes/measurements.md). The main points:
 
-Loop-unroll pragmas on the register lane kernel; leader-lane `simd_shuffle` for the register kernel's scale/bias and
-group-sum loads (slower, 47.8 vs 51.5 tok/s); a two-group prefetch (slower); tiling the drafter attention's key loop;
-removing drafter barriers (the encoder is serial, so no change); command-buffer split thresholds for the drafter frame;
-a later verify commit interval; the register kernel's maximum-threadgroup attribute. Profiling showed the verify matmuls
-run at roughly 85% of memory bandwidth, and that acceptance on the long-copy fixture is about 65% in the first 150 rounds
-and about 100% afterwards.
+- **The official decode time includes the seed prompt pass** (~28%), so prefill effectively weighs ~0.46 of the score, not 0.25.
+- The live promotion bar is 75 bps, not the 200 in `benchmark.json`.
+- Ceilings on M5 Max: 579 GB/s read (decode GEMV reaches ~95%), 66 TFLOPS tensor ops (prompt gate/up ~90%).
+  Prompt GEMM is ~93% tensor-op bound; acceptance is ~98% of its depth-1 ceiling.
+- The decode loop is bound by dependent-load latency, not bytes, so prefetching beats shrinking.
+- Ranked-box variance (~1–2%) and local noise (~±0.3%) mean small exact gains are worth banking even when local A/B can't see them.
+
+## Yukon submissions
+
+| Submission | What | Official | Result |
+|---|---|---|---|
+| [`7ea68997`](notes/yukon-submission-7ea68997-note.md) | `0231208a` + A | 1.33430 | rejected, 0.013% behind an entry with the same idea found independently |
+| [`1afa673b`](notes/yukon-submission-1afa673b-note.md) | `ff408317` + B | 1.35639 | rejected |
+| [`ea8f8271`](notes/yukon-submission-ea8f8271-note.md) | `2d06a685` + B + 1 | 1.37849 | rejected |
+| [`5317b10e`](notes/yukon-submission-5317b10e-note.md) | `ea8f8271` + ported polling and small adapters + drafter lean | 1.38217 | rejected, 0.08% short |
+| [`f3f8f654`](notes/yukon-submission-f3f8f654-note.md) | `5317b10e` + 3 | 1.38132 | rejected |
+| [`23d85725`](notes/yukon-submission-23d85725-note.md) | `e75967a0` + 2 + B + 3 | 1.52942 | rejected, 0.08% short |
+| [`ca8506c9`](notes/yukon-submission-ca8506c9-note.md) | `2c41feb1` + ported dictionary metadata and event waits | 1.54015 | rejected |
+| [`07fd50da`](notes/yukon-submission-07fd50da-note.md) | `38c11ee6` + 5 + 4 + ported wait skip | **1.63957** | **promoted** |
+| [`c903ef78`](notes/yukon-submission-c903ef78-note.md) | `7a2d34f1` + three ported pieces (composition only) | — | validating |
 
 ## Attribution
 
-This work builds on public submissions to the same challenge and on upstream TensorFold (Apache-2.0):
-terrapinelf (`0231208a`, `4ccaa92c`), ercumentyildirim (`9b7f90ee`, `f379bc8c`, `e836f316`), fkiene, GordoAR and e-man07,
-and the TensorFold authors. The patches here are only the changes made in this work.
+This work builds on public submissions to the same challenge and on upstream TensorFold (Apache-2.0). Ported or built-upon work
+is named where used: terrapinelf, e-man07, kshitij-hash, fkiene, ercumentyildirim, ArthurOstapenko, GordoAR, i34-9 and the
+TensorFold authors. Each submission note lists its exact dependencies.
