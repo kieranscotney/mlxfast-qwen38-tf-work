@@ -1,0 +1,43 @@
+diff --git a/zig/kernels/metal/qwen27/attention_mpp.metal b/zig/kernels/metal/qwen27/attention_mpp.metal
+index 8bd3025..8a80806 100644
+--- a/zig/kernels/metal/qwen27/attention_mpp.metal
++++ b/zig/kernels/metal/qwen27/attention_mpp.metal
+@@ -160,6 +160,7 @@ Q27_PREFIX(14)
+ Q27_PREFIX(15)
+ Q27_PREFIX(16)
+ template [[host_name("q27_attn_prefix_quarter_1")]] kernel void q27_attn_prefix<1, 4>(device const bfloat*, device const Q27AttnReadPtrs*, constant float*, device const int*, device const int*, device float*, device float*, device float*, device const int*, device atomic_uint*, constant uint&, device atomic_uint*, constant uint&, uint3, uint3, ushort, ushort, ushort);
++template [[host_name("q27_attn_prefix_eighth_1")]] kernel void q27_attn_prefix<1, 8>(device const bfloat*, device const Q27AttnReadPtrs*, constant float*, device const int*, device const int*, device float*, device float*, device float*, device const int*, device atomic_uint*, constant uint&, device atomic_uint*, constant uint&, uint3, uint3, ushort, ushort, ushort);
+ 
+ kernel void q27_attn_tail(device const bfloat* QB [[buffer(0)]], device const Q27AttnReadPtrs* caches [[buffer(1)]],
+     constant float* scale [[buffer(2)]], device const int* meta [[buffer(3)]], device const int* paths [[buffer(4)]], device const int* nodes [[buffer(5)]],
+diff --git a/zig/src/families/qwen27/attention.zig b/zig/src/families/qwen27/attention.zig
+index 5b1cd4b..21d4813 100644
+--- a/zig/src/families/qwen27/attention.zig
++++ b/zig/src/families/qwen27/attention.zig
+@@ -246,7 +246,7 @@ pub const Attention = struct {
+         const units = device.tensorUnits();
+         const split_tail: ?mtl.Pipeline = if (units) try mtl.Pipeline.init(device, library, "q27_attn_tail_split", false) else null;
+         errdefer if (split_tail) |pipe| pipe.deinit();
+-        const prefix_quarter: ?mtl.Pipeline = if (units) try mtl.Pipeline.init(device, library, "q27_attn_prefix_quarter_1", false) else null;
++        const prefix_quarter: ?mtl.Pipeline = if (units) try mtl.Pipeline.init(device, library, "q27_attn_prefix_eighth_1", false) else null;
+         errdefer if (prefix_quarter) |pipe| pipe.deinit();
+         const chain_words: ?mtl.Buffer = if (units) try device.buffer(32, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked) else null;
+         errdefer if (chain_words) |b| b.deinit();
+@@ -516,7 +516,7 @@ pub const Attention = struct {
+             // (kv head, chunk) groups to fill the GPU, so each tile takes its own threadgroup (a tile's math is the same)
+             const sg: u32 = @min(plan.tiles, if (plan.prefix_chunks >= 64) @as(u32, 6) else if (plan.prefix_chunks >= 16) @as(u32, 4) else 1);
+             prefix_groups = g.kv_heads * plan.prefix_chunks * ((plan.tiles + sg - 1) / sg);
+-            // Sparse prefix grids benefit from four narrower accumulator owners.
++            // Sparse prefix grids take eight narrower accumulator owners (32 output columns a SIMD group).
+             // Keep the original partition once the grid has enough groups to fill the GPU.
+             const quarter = sg == 1 and prefix_groups < 128 and a.prefix_quarter != null;
+             e.setPipeline(if (quarter) a.prefix_quarter.? else a.prefix[sg - 1]);
+@@ -532,7 +532,7 @@ pub const Attention = struct {
+             e.setValue(@as(u32, @intFromBool(chain != null)), 10);
+             e.setBuffer(words, 16, 11);
+             e.setValue(if (appended) preprocessGroups(g) * plan.rows else 0, 12);
+-            e.dispatchGroups(mtl.Size.of(g.kv_heads, plan.prefix_chunks, (plan.tiles + sg - 1) / sg), mtl.Size.of(if (quarter) 128 else 64 * sg, 1, 1));
++            e.dispatchGroups(mtl.Size.of(g.kv_heads, plan.prefix_chunks, (plan.tiles + sg - 1) / sg), mtl.Size.of(if (quarter) 256 else 64 * sg, 1, 1));
+             if (chain == null) e.barrier();
+         }
+         if (!plan.fused) {

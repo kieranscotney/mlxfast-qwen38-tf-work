@@ -1,0 +1,60 @@
+diff --git a/zig/src/core/affine4.zig b/zig/src/core/affine4.zig
+index 35e8707..eefa7a4 100644
+--- a/zig/src/core/affine4.zig
++++ b/zig/src/core/affine4.zig
+@@ -170,6 +170,8 @@ fn groups(weights: []const u16, words: []u32, scales: []u16, biases: []u16, firs
+ /// Below 4 bits the full range wastes levels on a group's outliers: the same rule (bias at the extreme of larger
+ /// magnitude, zero point snapped to an integer) on the range shrunk by each factor below, keeping the one whose bf16
+ /// scale and bias give the least squared error over the group. Codes clamp to the levels, so clipped values saturate.
++/// Lloyd steps after the clip search (0: the search alone).
++pub const lloyd_steps: usize = 8;
+ fn clipped(values: []const u16, out: []u32, scale_out: *u16, bias_out: *u16, lower: f32, upper: f32, levels: f32) Error!void {
+     const shrinks = [_]f32{ 1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6, 0.55, 0.5, 0.45, 0.4 };
+     var best_err: f32 = std.math.inf(f32);
+@@ -203,6 +205,46 @@ fn clipped(values: []const u16, out: []u32, scale_out: *u16, bias_out: *u16, low
+         }
+     }
+     if (!std.math.isFinite(best_err)) return error.NonFiniteAffineRange;
++    // Lloyd refinement: least-squares (scale, bias) for the current codes, then codes for the new pair; each step is kept
++    // only if the group's squared error with the bf16 pair falls.
++    var step: usize = 0;
++    while (step < lloyd_steps) : (step += 1) {
++        const s0 = asFloat(best_scale);
++        const b0 = asFloat(best_bias);
++        var sc: f64 = 0;
++        var sv: f64 = 0;
++        var scc: f64 = 0;
++        var scv: f64 = 0;
++        for (values) |bits| {
++            const v = asFloat(bits);
++            const c: f64 = @min(levels, @max(@as(f32, 0), @round((v - b0) / s0)));
++            sc += c;
++            sv += v;
++            scc += c * c;
++            scv += c * v;
++        }
++        const n: f64 = @floatFromInt(values.len);
++        const den = n * scc - sc * sc;
++        if (den <= 0) break;
++        const s_fit: f64 = (n * scv - sc * sv) / den;
++        const b_fit: f64 = (sv - s_fit * sc) / n;
++        const s16 = asBf16(@floatCast(s_fit));
++        const b16 = asBf16(@floatCast(b_fit));
++        const s1 = asFloat(s16);
++        const b1 = asFloat(b16);
++        if (s1 == 0 or !std.math.isFinite(s1) or !std.math.isFinite(b1)) break;
++        var err: f32 = 0;
++        for (values) |bits| {
++            const v = asFloat(bits);
++            const code = @min(levels, @max(@as(f32, 0), @round((v - b1) / s1)));
++            const d = v - (b1 + s1 * code);
++            err += d * d;
++        }
++        if (!(err < best_err)) break;
++        best_err = err;
++        best_scale = s16;
++        best_bias = b16;
++    }
+     scale_out.* = best_scale;
+     bias_out.* = best_bias;
+     const s = asFloat(best_scale);

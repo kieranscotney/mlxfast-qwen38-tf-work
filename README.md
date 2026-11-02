@@ -26,6 +26,10 @@ of my TensorFold fork.
 | 4 | Drafter top-k as a SIMD-shuffle tournament ([patch](patches/04-drafter-simd-topk.patch)) | 38c11ee6 | small, exact | in promoted `07fd50da` |
 | 5 | Two-tile prompt inputs for the mixer projections ([patch](patches/05-two-tile-prompt-inputs.patch)) | 38c11ee6 | prompt GPU −10.2 ms, pf +0.95% | **promoted** `07fd50da` 1.63957 |
 | 6 | Depth-one star GDN verify kernel ([patch](patches/06-gdn-star-verify.patch)) | 7edba466 | 8-row verify −0.31 ms, dec +0.05% | not submitted; same idea by ArthurOstapenko scored +0.45% |
+| 7 | Four-column prompt DeltaNet scan ([patch](patches/07-four-column-prompt-scan.patch)) | b490cd9f | prompt scan 4 columns a lane | in `631553ae` 1.71545; carried in `c1d09a0f` and every leader since |
+| 8 | Eight-part sparse decode attention prefixes ([patch](patches/08-eight-part-decode-prefix.patch)) | c153ffc9 / 292d7fda | dec +0.12% (5 rounds) | in `da328474`, `254ee549` |
+| 9 | Sibling floor 0.02, calibrated on independent prompts ([patch](patches/09-sibling-floor-0.02.patch)) | 292d7fda | dec +0.10% (5 rounds) | in `da328474` |
+| 10 | Drafter MLP down projection on its 2-bit copy ([patch](patches/10-drafter-down-on-2-bits.patch)) | a5b756b6 | dec +0.61%; with 8: +0.85% | in `254ee549` |
 
 Notes on what each one changes:
 
@@ -41,6 +45,17 @@ Notes on what each one changes:
 6. With sibling drafts at depth 1 the verify tree is a star. `tf_delta_gdn_star` pairs value columns per simdgroup and runs
    independent children two at a time instead of the generic tree-slot path. Exact on 3×1024-token tapes.
 
+7. Each lane of the prompt DeltaNet scan carries four value columns instead of two, sharing the key and query conversions.
+   terrapinelf later added running row offsets and reduce-scatter sums on top (`a8112696`, `c153ffc9`).
+8. `q27_attn_prefix<1, 8>` instantiated and dispatched in place of the quarter form on tensor-unit devices: the verify's
+   full-attention prefixes split over twice as many SIMD groups. Same merge code, so exact.
+9. A sibling the drafter rates under 2% is not verified. Measured on independent prompts; fkiene's 0.7% floor on the same
+   base read lower officially (`9f65dcb3` 1.75200 against `292d7fda` 1.75637).
+10. The drafter's 2-bit reg kernels run at the tensor units' rate (~1.48 T weights/s on M5 Max) while its q4 down
+    projections are bandwidth-bound, so down on its 2-bit copy shortens the drafter frame (~449 to ~300 us) for a small
+    acceptance cost. Checked on three independent prompts (+0.2 to +0.35%). A least-squares refit of the 2-bit copies
+    ([negative patch](patches/x1-drafter-lloyd-refit-NEGATIVE.patch)) lowered weight error but halved the gain.
+
 ## Measurement finds
 
 The full write-up, with a table of 22 dead ends, is in [`notes/measurements.md`](notes/measurements.md). The main points:
@@ -50,6 +65,12 @@ The full write-up, with a table of 22 dead ends, is in [`notes/measurements.md`]
 - Ceilings on M5 Max: 579 GB/s read (decode GEMV reaches ~95%), 66 TFLOPS tensor ops (prompt gate/up ~90%).
   Prompt GEMM is ~93% tensor-op bound; acceptance is ~98% of its depth-1 ceiling.
 - The decode loop is bound by dependent-load latency, not bytes, so prefetching beats shrinking.
+- **Official legs are public**: each validation PR comment carries both legs and the box. One pair is scored; the formula
+  `(ctrl_prefill/cand_prefill)^0.25 x (ctrl_decode/cand_decode)^0.75` reproduces every score to 1e-5
+  ([script](tools/official_legs.py), [all entries](notes/official-legs-all-entries.txt)). Box `m5-max-128gb-2-1` has a very
+  stable control leg; `laptop-1` drifted ~1.5% slower through the evening of 1 Nov, which explains `da328474`.
+- Curated state of the work: [`notes/summary.md`](notes/summary.md); every experiment with its result:
+  [`notes/experiment-ledger.md`](notes/experiment-ledger.md).
 - Ranked-box variance (~1–2%) and local noise (~±0.3%) mean small exact gains are worth banking even when local A/B can't see them.
 
 ## Yukon submissions
@@ -64,10 +85,13 @@ The full write-up, with a table of 22 dead ends, is in [`notes/measurements.md`]
 | [`23d85725`](notes/yukon-submission-23d85725-note.md) | `e75967a0` + 2 + B + 3 | 1.52942 | rejected, 0.08% short |
 | [`ca8506c9`](notes/yukon-submission-ca8506c9-note.md) | `2c41feb1` + ported dictionary metadata and event waits | 1.54015 | rejected |
 | [`07fd50da`](notes/yukon-submission-07fd50da-note.md) | `38c11ee6` + 5 + 4 + ported wait skip | **1.63957** | **promoted** |
-| [`c903ef78`](notes/yukon-submission-c903ef78-note.md) | `7a2d34f1` + three ported pieces (composition only) | — | validating |
+| [`c903ef78`](notes/yukon-submission-c903ef78-note.md) | `7a2d34f1` + three ported pieces (composition only) | — | runner fault, no score |
+| [`631553ae`](notes/yukon-submission-631553ae-note.md) | `b490cd9f` + 6691 attention + 7 | 1.71545 | rejected; 7 carried by `c1d09a0f` (promoted) |
+| [`da328474`](notes/yukon-submission-da328474-note.md) | `292d7fda` + 8 + 9 | 1.74109 | rejected (laptop-1 box) |
+| [`254ee549`](notes/yukon-submission-254ee549-note.md) | `a5b756b6` + 10 + 8 | — | validating |
 
 ## Attribution
 
 This work builds on public submissions to the same challenge and on upstream TensorFold (Apache-2.0). Ported or built-upon work
-is named where used: terrapinelf, e-man07, kshitij-hash, fkiene, ercumentyildirim, ArthurOstapenko, GordoAR, i34-9 and the
-TensorFold authors. Each submission note lists its exact dependencies.
+is named where used: terrapinelf, e-man07, kshitij-hash, fkiene, ercumentyildirim, ArthurOstapenko, GordoAR, i34-9, jungjipdo, a-github-name, otarkhan, mrv777,
+akki-rock05 (CUDA drafter refit idea) and the TensorFold authors. Each submission note lists its exact dependencies.

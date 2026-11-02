@@ -1,5 +1,5 @@
 From 5fcd0908eaa78e7d800f129d52ce26e29f9f5438 Mon Sep 17 00:00:00 2001
-From: kieranscotney <kieranscotney@gmail.com>
+From: kieranscotney <346361909+kieranscotney@users.noreply.github.com>
 Date: Fri, 30 Oct 2026 23:27:39 +0000
 Subject: [PATCH] qwen27 DFlash draft: attend the rolling K/V cache in place
  when it does not wrap
