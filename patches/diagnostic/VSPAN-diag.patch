@@ -1,0 +1,66 @@
+diff --git a/Vendor/TensorFold/zig/src/core/segments.zig b/Vendor/TensorFold/zig/src/core/segments.zig
+index cfcb447..60a2266 100644
+--- a/Vendor/TensorFold/zig/src/core/segments.zig
++++ b/Vendor/TensorFold/zig/src/core/segments.zig
+@@ -154,6 +154,18 @@ pub fn runCommittingFrom(device: mtl.Device, queues: []const mtl.Queue, layers:
+         lanes[0].cb.signal(poll_event.?, poll_value);
+     }
+     for (lanes[0..n]) |l| l.cb.commit();
++    if (polled) {
++        for (diag_cbs[0..diag_n]) |cb| cb.release();
++        diag_n = 0;
++        for (done[0..n_done]) |cb| if (diag_n < diag_cbs.len) {
++            diag_cbs[diag_n] = cb.retain();
++            diag_n += 1;
++        };
++        for (lanes[0..n]) |l| if (diag_n < diag_cbs.len) {
++            diag_cbs[diag_n] = l.cb.retain();
++            diag_n += 1;
++        };
++    }
+     // work the family queues behind the last chunk before the host waits on it (a round's keep)
+     const queued: anyerror!void = if (comptime @hasDecl(std.meta.Child(@TypeOf(fam)), "committed")) fam.committed() else {};
+     if (signalled) {
+@@ -199,3 +211,6 @@ pub fn runCommittingFrom(device: mtl.Device, queues: []const mtl.Queue, layers:
+ test {
+     _ = stagger;
+ }
++
++pub var diag_cbs: [32]mtl.CommandBuffer = undefined;
++pub var diag_n: usize = 0;
+diff --git a/Vendor/TensorFold/zig/src/families/qwen27/dflash/generation.zig b/Vendor/TensorFold/zig/src/families/qwen27/dflash/generation.zig
+index c0e077d..d2407e1 100644
+--- a/Vendor/TensorFold/zig/src/families/qwen27/dflash/generation.zig
++++ b/Vendor/TensorFold/zig/src/families/qwen27/dflash/generation.zig
+@@ -146,6 +146,7 @@ pub const Generation = struct {
+     }
+     /// A round's keep runs behind the drafter; it ends before the next verify and before a run returns.
+     fn finishKeep(g: *Generation) !void {
++        spanNote();
+         const cb = g.keep orelse return;
+         g.keep = null;
+         defer cb.release();
+@@ -357,3 +358,23 @@ test "true request budget keeps a verified non-prefix continuation across delive
+     try std.testing.expectEqualSlices(u32, &.{ 2, 3, 4 }, terminal.tokens);
+     try std.testing.expect(terminal.pending == null);
+ }
++
++var span_n: u64 = 0;
++var span_sum: f64 = 0;
++fn spanNote() void {
++    const seg = @import("core").segments;
++    if (seg.diag_n == 0) return;
++    var vs: f64 = 1e30;
++    var ve: f64 = 0;
++    for (seg.diag_cbs[0..seg.diag_n]) |c| {
++        c.wait();
++        vs = @min(vs, c.gpuStart());
++        ve = @max(ve, c.gpuEnd());
++    }
++    for (seg.diag_cbs[0..seg.diag_n]) |c| c.release();
++    seg.diag_n = 0;
++    if (ve - vs > 0.1) return;
++    span_n += 1;
++    span_sum += ve - vs;
++    if (span_n % 300 == 0) std.log.warn("VSPAN n={d} verify_span={d:.3}ms", .{ span_n, span_sum / @as(f64, @floatFromInt(span_n)) * 1e3 });
++}

@@ -1,0 +1,265 @@
+diff --git a/Vendor/TensorFold/zig/kernels/metal/core/deltanet_slots.metal b/Vendor/TensorFold/zig/kernels/metal/core/deltanet_slots.metal
+index 7ed667e..6bb2e0b 100644
+--- a/Vendor/TensorFold/zig/kernels/metal/core/deltanet_slots.metal
++++ b/Vendor/TensorFold/zig/kernels/metal/core/deltanet_slots.metal
+@@ -122,6 +122,44 @@ kernel void tf_delta_gdn_tree_pair(device const bfloat* query [[buffer(0)]],
+       advanced[at + p.dk] = last1[part];
+     }
+ }
++// A depth-one star (row 0 from the root, every other row a child of row 0) for two adjacent value columns a simdgroup:
++// each row's update and read are tree_pair's on the same state; independent children run two at a time.
++kernel void tf_delta_gdn_star(device const bfloat* query [[buffer(0)]],
++                         device const bfloat* key [[buffer(1)]],
++                         device const bfloat* value [[buffer(2)]],
++                         device const float* decay [[buffer(3)]],
++                         device const bfloat* mixing [[buffer(4)]],
++                         device const float* committed [[buffer(5)]],
++                         device const int* parents [[buffer(6)]],
++                         device const TfDeltaSegment* segments [[buffer(7)]],
++                         constant TfDeltaParams& p [[buffer(8)]],
++                         device bfloat* output [[buffer(9)]],
++                         device float* snapshots [[buffer(10)]],
++                         device const TfDeltaSlotStep* steps [[buffer(11)]],
++                         uint3 position [[thread_position_in_grid]],
++                         uint lane [[thread_index_in_simdgroup]]) {
++  const uint segment_index = position.z / p.nv, head = position.z % p.nv;
++  const uint dimension = position.y * 2, key_head = head / (p.nv / p.nk);
++  const TfDeltaSegment span = segments[segment_index];
++  const uint state_stride = p.nv * p.dv * p.dk;
++  const uint column = (head * p.dv + dimension) * p.dk + lane * 4;
++  float4 s0, s1;
++  for (uint part = 0; part < 4; ++part) {
++    s0[part] = committed[span.state_slot * state_stride + column + part];
++    s1[part] = committed[span.state_slot * state_stride + column + p.dk + part];
++  }
++  tf_delta_tree_node2(s0, s1, query, key, value, decay, mixing, p, output, steps[span.first].row, head, key_head, dimension, lane);
++  uint at = 1;
++  for (; at + 1 < span.rows; at += 2) {
++    float4 a0 = s0, a1 = s1, b0 = s0, b1 = s1;
++    tf_delta_tree_node2(a0, a1, query, key, value, decay, mixing, p, output, steps[span.first + at].row, head, key_head, dimension, lane);
++    tf_delta_tree_node2(b0, b1, query, key, value, decay, mixing, p, output, steps[span.first + at + 1].row, head, key_head, dimension, lane);
++  }
++  if (at < span.rows) {
++    float4 a0 = s0, a1 = s1;
++    tf_delta_tree_node2(a0, a1, query, key, value, decay, mixing, p, output, steps[span.first + at].row, head, key_head, dimension, lane);
++  }
++}
+ #define TF_TREE_SLOTS(N) template [[host_name("tf_delta_gdn_tree_slots_" #N)]] kernel void tf_delta_gdn_tree_slots<N>(device const bfloat*, device const bfloat*, device const bfloat*, device const float*, device const bfloat*, device const float*, device const int*, device const TfDeltaSegment*, constant TfDeltaParams&, device bfloat*, device float*, device const TfDeltaSlotStep*, device float*, device float*, uint3, uint);
+ TF_TREE_SLOTS(1)
+ TF_TREE_SLOTS(2)
+diff --git a/Vendor/TensorFold/zig/kernels/metal/qwen27/attention_mpp.metal b/Vendor/TensorFold/zig/kernels/metal/qwen27/attention_mpp.metal
+index b81b68c..523e0ea 100644
+--- a/Vendor/TensorFold/zig/kernels/metal/qwen27/attention_mpp.metal
++++ b/Vendor/TensorFold/zig/kernels/metal/qwen27/attention_mpp.metal
+@@ -22,6 +22,7 @@ kernel void q27_attn_prefix(device const bfloat* Qp [[buffer(0)]], device const
+   const int NCH = meta[1], SGA = meta[2];
+   const int st = tile < SGA ? tile_stream[tile] : 0;
+   const int L = meta[MG + st * MS + 9], NQ = meta[MG + st * MS + 2], S0 = meta[MG + st * MS + 4];
++  const bool star = meta[MG + st * MS + 10] != 0; // siblings: the cached keys, row 0's and the row's own
+   const int lt = tile - meta[MG + st * MS + 3];
+   const int RP = 16 * SGA;
+   const short qid = lane >> 2;
+@@ -66,7 +67,9 @@ kernel void q27_attn_prefix(device const bfloat* Qp [[buffer(0)]], device const
+     float s[TK / 2];
+     for (int i = 0; i < TK / 2; i++) {
+       const int key = kt + (i >> 3) * 16 + fn + (i & 3);
+-      s[i] = key < ((i & 4) ? e1 : e0) ? S[i] * scale[0] : -INFINITY;
++      const int end = (i & 4) ? e1 : e0;
++      const bool seen = key < end && (!star || key <= S0 || key == end - 1);
++      s[i] = seen ? S[i] * scale[0] : -INFINITY;
+     }
+     float x0 = -INFINITY, x1 = -INFINITY;
+     for (int i = 0; i < TK / 2; i++) { if (i & 4) x1 = max(x1, s[i]); else x0 = max(x0, s[i]); }
+diff --git a/Vendor/TensorFold/zig/src/core/deltanet_kernels.zig b/Vendor/TensorFold/zig/src/core/deltanet_kernels.zig
+index c36124f..33bc631 100644
+--- a/Vendor/TensorFold/zig/src/core/deltanet_kernels.zig
++++ b/Vendor/TensorFold/zig/src/core/deltanet_kernels.zig
+@@ -44,6 +44,8 @@ pub const Kernels = struct {
+     post_rows: metal.Pipeline,
+     /// tf_delta_gdn_tree_slots<1> for two adjacent value columns a simdgroup (a chain's verify).
+     tree_pair: metal.Pipeline,
++    /// tf_delta_gdn_star: a depth-one star's rows on tree_pair's two-column layout.
++    star: metal.Pipeline,
+ 
+     pub fn init(device: metal.Device) !Kernels {
+         const library = try metal.Library.fromSource(device, source.core_deltanet, metal.CompileOptions.mlx());
+@@ -70,6 +72,7 @@ pub const Kernels = struct {
+             "tree_slots_8",
+             "tree_slots_16",
+             "tree_pair",
++            "star",
+         };
+         var pipelines: [names.len]metal.Pipeline = undefined;
+         var done: usize = 0;
+@@ -100,6 +103,7 @@ pub const Kernels = struct {
+             .pre_rows = pipelines[13],
+             .post_rows = pipelines[14],
+             .tree_pair = pipelines[20],
++            .star = pipelines[21],
+         };
+     }
+ 
+@@ -121,6 +125,7 @@ pub const Kernels = struct {
+             k.pre_rows,
+             k.post_rows,
+             k.tree_pair,
++            k.star,
+         }) |p| p.deinit();
+         for (k.pipelines.tree_slots) |p| p.deinit();
+         k.library.deinit();
+diff --git a/Vendor/TensorFold/zig/src/families/qwen27/attention_plan.zig b/Vendor/TensorFold/zig/src/families/qwen27/attention_plan.zig
+index 0308f18..50733ad 100644
+--- a/Vendor/TensorFold/zig/src/families/qwen27/attention_plan.zig
++++ b/Vendor/TensorFold/zig/src/families/qwen27/attention_plan.zig
+@@ -81,7 +81,7 @@ pub const Plan = struct {
+         var ca_max: u32 = 0;
+         var cb_max: u32 = 0;
+         var fused = geometry.shared_prefix and geometry.fuse_chain;
+-        for (windows) |w| for (w.parents, 0..) |p, r| if (r > 0 and p != @as(i32, @intCast(r)) - 1) {
++        for (windows) |w| if (!isStar(w.parents)) for (w.parents, 0..) |p, r| if (r > 0 and p != @as(i32, @intCast(r)) - 1) {
+             fused = false;
+         };
+         for (windows, 0..) |w, st| {
+@@ -98,9 +98,12 @@ pub const Plan = struct {
+             // the stream's chunk counts are its rows' widest, each row's in its own chunk
+             var ca: u32 = 0;
+             var cb: u32 = 0;
+-            for (depths[0..w.parents.len]) |depth| {
+-                const ck = chunkFor(w.start + depth);
+-                ca = @max(ca, if (fused) (w.start + depth + ck) / ck else (pt + ck - 1) / ck);
++            const star = fused and isStar(w.parents);
++            for (depths[0..w.parents.len], 0..) |depth, r| {
++                // a fused star's row reads its own key where the append put it, at start + row
++                const key: u32 = if (star) @intCast(r) else depth;
++                const ck = chunkFor(w.start + key);
++                ca = @max(ca, if (fused) (w.start + key + ck) / ck else (pt + ck - 1) / ck);
+                 if (!fused) cb = @max(cb, (w.start + depth) / ck - pt / ck + 1);
+             }
+             const count: u32 = @intCast((geometry.group() * w.parents.len + 15) / 16);
+@@ -115,6 +118,7 @@ pub const Plan = struct {
+             meta[at + 7] = @intCast(w.capacity * geometry.dim);
+             meta[at + 8] = meta[at + 7];
+             meta[at + 9] = @intCast(limit);
++            meta[at + 10] = @intFromBool(star);
+             // words 10 and 11 are spare: a row's chunk and the prefix chunks it merges are its node words 2 and 3
+             row_count = try std.math.add(u32, row_count, @intCast(w.parents.len));
+             tile_count += count;
+@@ -152,12 +156,13 @@ pub const Plan = struct {
+                 const node = first + r;
+                 const depth: usize = if (parent < 0) 0 else @as(usize, @intCast(nodes[(first + @as(usize, @intCast(parent))) * node_words])) + 1;
+                 const position: u32 = w.start + @as(u32, @intCast(depth));
+-                const ck = chunkFor(position);
++                const key: u32 = if (meta[at + 10] != 0) w.start + @as(u32, @intCast(r)) else position;
++                const ck = chunkFor(key);
+                 nodes[node * node_words] = @intCast(depth);
+                 nodes[node * node_words + 1] = @intCast(st);
+                 nodes[node * node_words + 2] = @intCast(ck);
+                 // a chain's merge reads every chunk up to its own key, another round's the whole ones before its tail
+-                nodes[node * node_words + 3] = @intCast(if (fused) (position + ck) / ck else pt / ck);
++                nodes[node * node_words + 3] = @intCast(if (fused) (key + ck) / ck else pt / ck);
+                 positions[node] = @intCast(position);
+                 if (depth >= path_width) continue; // prompt chains place rows by position
+                 if (parent >= 0) @memcpy(paths[node * path_width ..][0..depth], paths[(first + @as(usize, @intCast(parent))) * path_width ..][0..depth]);
+@@ -447,3 +452,10 @@ test "target attention reads every config dimension without widening kernel qual
+     c.rope_dims = 32;
+     try std.testing.expectError(error.TargetAttentionShape, Geometry.fromConfig(c, true));
+ }
++
++/// Three or more rows, every row after the first a child of row 0 (a depth-one star of siblings).
++fn isStar(parents: []const i32) bool {
++    if (parents.len < 3 or parents[0] != -1) return false;
++    for (parents[1..]) |p| if (p != 0) return false;
++    return true;
++}
+diff --git a/Vendor/TensorFold/zig/src/families/qwen27/dflash/generation.zig b/Vendor/TensorFold/zig/src/families/qwen27/dflash/generation.zig
+index c0e077d..6e7b64b 100644
+--- a/Vendor/TensorFold/zig/src/families/qwen27/dflash/generation.zig
++++ b/Vendor/TensorFold/zig/src/families/qwen27/dflash/generation.zig
+@@ -209,6 +209,8 @@ pub const Generation = struct {
+         g.runner.lead = .{ .ptr = &g.draft.backend.frame, .encode = @import("runtime_frame.zig").Frame.endBridge };
+         defer g.runner.lead = null;
+         try g.runner.verifyHead(round, .all);
++        { const w = @min(ids.len, 15); wdiag_n[w] += 1; wdiag_t[w] += g.runner.last_gpu_seconds; wdiag_all += 1;
++          if (wdiag_all % 400 == 0) for (wdiag_n, wdiag_t, 0..) |c, t, wi| if (c > 0) std.log.warn("WIDTH rows={d} rounds={d} verify_gpu={d:.3}ms", .{ wi, c, t / @as(f64, @floatFromInt(c)) * 1e3 }); }
+         errdefer g.runner.failed = true;
+         try g.runner.taps.complete();
+         const shape = picks.shape orelse return error.DraftKeepGpuFailure;
+@@ -357,3 +359,7 @@ test "true request budget keeps a verified non-prefix continuation across delive
+     try std.testing.expectEqualSlices(u32, &.{ 2, 3, 4 }, terminal.tokens);
+     try std.testing.expect(terminal.pending == null);
+ }
++
++var wdiag_n: [16]u64 = @splat(0);
++var wdiag_t: [16]f64 = @splat(0);
++var wdiag_all: u64 = 0;
+diff --git a/Vendor/TensorFold/zig/src/families/qwen27/gdn.zig b/Vendor/TensorFold/zig/src/families/qwen27/gdn.zig
+index d1cb18a..c90470f 100644
+--- a/Vendor/TensorFold/zig/src/families/qwen27/gdn.zig
++++ b/Vendor/TensorFold/zig/src/families/qwen27/gdn.zig
+@@ -112,6 +112,7 @@ pub const Round = struct {
+     sums: ?Sums = null,
+     compact: bool,
+     slot_kernel: usize, // which tree_slots kernel holds the plan's peak of live states
++    star: bool = false, // one segment: row 0 from the root, every later row a child of row 0, nothing written back
+ 
+     pub fn init(shape: abi.Shape, kinds: abi.WeightKinds, p: abi.Params, plan: Plan, b: Buffers, pipelines: Pipelines) !Round {
+         if (plan.parents.len != p.rows or plan.segments.len == 0 or plan.keeps.len != plan.segments.len or (plan.compact and plan.slot_steps.len != p.rows)) return error.BadGdnPlan;
+@@ -162,6 +163,21 @@ pub const Round = struct {
+ 
+     /// forward, a chain's one-slot tree (tf_delta_gdn_tree_pair) taking two value columns a simdgroup.
+     pub fn forwardPair(r: Round, e: metal.ComputeEncoder, pair: metal.Pipeline, post_rows: metal.Pipeline) void {
++        return r.forwardPairStar(e, pair, null, post_rows);
++    }
++    /// forwardPair; a star round (Round.star) takes tf_delta_gdn_star instead of its tree_slots kernel.
++    pub fn forwardPairStar(r: Round, e: metal.ComputeEncoder, pair: metal.Pipeline, star: ?metal.Pipeline, post_rows: metal.Pipeline) void {
++        if (star) |sp| if (r.star and r.usesSlots() and r.p.dv % 2 == 0 and r.p.advance == 0) {
++            e.setPipeline(sp);
++            bind(e, .{ r.b.query, r.b.key, r.b.value, r.b.decay, r.b.mixing, r.b.state, r.b.parents, r.b.segments }, 0);
++            e.setValue(r.p, 8);
++            bind(e, .{ r.b.recurrent, r.b.snapshots }, 9);
++            r.b.slot_steps.bind(e, 11);
++            e.dispatchThreads(.{ .width = 32, .height = r.p.dv / 2, .depth = r.p.nv * r.segments }, .{ .width = 32, .height = 4, .depth = 1 });
++            e.barrier();
++            r.gate(e, post_rows);
++            return;
++        };
+         if (!r.usesSlots() or r.slot_kernel != 0 or r.p.dv % 2 != 0) return r.forward(e, post_rows);
+         e.setPipeline(pair);
+         bind(e, .{ r.b.query, r.b.key, r.b.value, r.b.decay, r.b.mixing, r.b.state, r.b.parents, r.b.segments }, 0);
+diff --git a/Vendor/TensorFold/zig/src/families/qwen27/gdn_pool_gpu.zig b/Vendor/TensorFold/zig/src/families/qwen27/gdn_pool_gpu.zig
+index 8cbc280..31869e7 100644
+--- a/Vendor/TensorFold/zig/src/families/qwen27/gdn_pool_gpu.zig
++++ b/Vendor/TensorFold/zig/src/families/qwen27/gdn_pool_gpu.zig
+@@ -158,7 +158,7 @@ pub const Pool = struct {
+         prepared.prepareRows(pre.encoder, pool.kernels.pre_rows);
+         try pre.end();
+         var scan = profile.begin(pool.profiler, e, .gdn_scan);
+-        prepared.forwardPair(scan.encoder, pool.kernels.tree_pair, pool.kernels.post_rows);
++        prepared.forwardPairStar(scan.encoder, pool.kernels.tree_pair, pool.kernels.star, pool.kernels.post_rows);
+         try scan.end();
+     }
+ 
+@@ -335,6 +335,7 @@ pub const Pool = struct {
+         var result = try gdn.Round.init(pool.budget.shape, refs.scalars.kinds, p, plan, b, pool.kernels.pipelines);
+         result.tree_mode = pool.tree_mode;
+         result.p.advance = @intFromBool(pool.advances(plan));
++        result.star = isStar(plan);
+         if (refs.sums) |w| {
+             // one fp32 sum per 64-value group of each row, `stride` rows a group (tf_lane_sums' layout)
+             const groups = pool.budget.shape.value / 64;
+@@ -402,3 +403,15 @@ fn refSpan(r: Ref, bytes: usize) !gdn.Span {
+     if (r.offset > r.buffer.length() or bytes > r.buffer.length() - r.offset) return error.BadGdnBuffer;
+     return .{ .buffer = r.buffer, .offset = r.offset, .bytes = bytes };
+ }
++
++
++/// One compact segment of three or more rows: row 0 from the root, then children of row 0 only, in row order.
++fn isStar(plan: Plan) bool {
++    if (!plan.compact or plan.segments.len != 1 or plan.parents.len < 3 or plan.slot_steps.len != plan.parents.len) return false;
++    const seg = plan.segments[0];
++    if (seg.first != 0 or seg.rows != plan.parents.len) return false;
++    for (plan.parents, plan.slot_steps, 0..) |parent, step, row| {
++        if (parent != (if (row == 0) @as(i32, -1) else 0) or step.row != row) return false;
++    }
++    return true;
++}

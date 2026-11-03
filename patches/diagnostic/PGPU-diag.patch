@@ -1,0 +1,59 @@
+diff --git a/Vendor/TensorFold/zig/src/core/segments.zig b/Vendor/TensorFold/zig/src/core/segments.zig
+index 57c3024..3078561 100644
+--- a/Vendor/TensorFold/zig/src/core/segments.zig
++++ b/Vendor/TensorFold/zig/src/core/segments.zig
+@@ -148,6 +148,18 @@ pub fn runCommittingFrom(device: mtl.Device, queues: []const mtl.Queue, layers:
+         lanes[0].cb.signal(poll_event.?, poll_value);
+     }
+     for (lanes[0..n]) |l| l.cb.commit();
++    {
++        for (diag_cbs[0..diag_n]) |cb| cb.release();
++        diag_n = 0;
++        for (done[0..n_done]) |cb| if (diag_n < diag_cbs.len) {
++            diag_cbs[diag_n] = cb.retain();
++            diag_n += 1;
++        };
++        for (lanes[0..n]) |l| if (diag_n < diag_cbs.len) {
++            diag_cbs[diag_n] = l.cb.retain();
++            diag_n += 1;
++        };
++    }
+     // work the family queues behind the last chunk before the host waits on it (a round's keep)
+     const queued: anyerror!void = if (comptime @hasDecl(std.meta.Child(@TypeOf(fam)), "committed")) fam.committed() else {};
+     if (signalled) {
+@@ -193,3 +205,6 @@ pub fn runCommittingFrom(device: mtl.Device, queues: []const mtl.Queue, layers:
+ test {
+     _ = stagger;
+ }
++
++pub var diag_cbs: [64]mtl.CommandBuffer = undefined;
++pub var diag_n: usize = 0;
+diff --git a/Vendor/TensorFold/zig/src/families/qwen27/dflash/generation.zig b/Vendor/TensorFold/zig/src/families/qwen27/dflash/generation.zig
+index c0e077d..7f16245 100644
+--- a/Vendor/TensorFold/zig/src/families/qwen27/dflash/generation.zig
++++ b/Vendor/TensorFold/zig/src/families/qwen27/dflash/generation.zig
+@@ -118,6 +118,17 @@ pub const Generation = struct {
+         std.debug.assert(g.keep == null);
+         if (g.runner.failed or g.draft.backend.failed or g.draft.committed_end != g.runner.offsets[0] or ids.len == 0 or ids.len > g.runner.model.frame.capacity) return error.BadDraftContext;
+         try (TargetSession.Session{ .runner = g.runner }).promptChunk(ids, last);
++        if (ids.len > 1000) {
++            const seg = @import("core").segments;
++            var busy: f64 = 0;
++            for (seg.diag_cbs[0..seg.diag_n]) |cb| {
++                cb.wait();
++                busy += cb.gpuSeconds();
++            }
++            pgpu_n += 1;
++            pgpu_sum += busy;
++            std.log.warn("PGPU n={d} busy={d:.3}ms avg={d:.3}ms", .{ pgpu_n, busy * 1e3, pgpu_sum / @as(f64, @floatFromInt(pgpu_n)) * 1e3 });
++        }
+         try g.absorbChunk(ids.len);
+     }
+     /// `promptChunk` with decoded rows' arithmetic (an earlier reply's tokens).
+@@ -357,3 +368,6 @@ test "true request budget keeps a verified non-prefix continuation across delive
+     try std.testing.expectEqualSlices(u32, &.{ 2, 3, 4 }, terminal.tokens);
+     try std.testing.expect(terminal.pending == null);
+ }
++
++var pgpu_n: u64 = 0;
++var pgpu_sum: f64 = 0;

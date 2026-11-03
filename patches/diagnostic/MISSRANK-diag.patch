@@ -1,0 +1,56 @@
+diff --git a/Vendor/TensorFold/zig/src/families/qwen27/dflash/generation.zig b/Vendor/TensorFold/zig/src/families/qwen27/dflash/generation.zig
+index 5a36941..7392db6 100644
+--- a/Vendor/TensorFold/zig/src/families/qwen27/dflash/generation.zig
++++ b/Vendor/TensorFold/zig/src/families/qwen27/dflash/generation.zig
+@@ -16,6 +16,8 @@ pub const Result = struct { tokens: []u32, rounds: usize, verified: usize, match
+ pub const Extender = struct { ptr: *anyopaque, call: *const fn (*anyopaque, []const u32, u32) anyerror![]const u32 };
+ /// The weight of a round in Generation.accept_share, and the share below which frames draft on q4 copies.
+ const accept_step: f32 = 0.125;
++var miss_rank: [17]u32 = @splat(0);
++var acct: struct { rounds: usize = 0, landed: usize = 0, precise: usize = 0, rows: usize = 0, wall: f64 = 0, last: f64 = 0 } = .{};
+ const precise_below: f32 = 0.95;
+ /// The target's first layer's input projections, whole (quant_gpu.Kernels.warmAll): the first weights a verify streams.
+ fn warmFirstLayer(ptr: *anyopaque, e: mtl.ComputeEncoder) anyerror!void {
+@@ -422,6 +424,27 @@ pub const Generation = struct {
+         if (accepted.path.len == 0 or accepted.tokens.len == 0 or accepted.tokens.len > @min(@import("core").tree_round.max_rows, remaining)) return error.EmptyAcceptedDraft;
+         g.accept_share += (@as(f32, @floatFromInt(@intFromBool(accepted.matched > 0))) - g.accept_share) * accept_step;
+         g.draft.backend.precise = g.accept_share < precise_below;
++        acct.rounds += 1;
++        acct.landed += @intFromBool(accepted.matched > 0);
++        acct.precise += @intFromBool(g.draft.backend.precise);
++        acct.rows += ids.len;
++        if (accepted.matched == 0 and accepted.tokens.len > 0) {
++            var rank: usize = 16;
++            for (@import("selector.zig").last_candidates, 0..) |id, i| if (id == accepted.tokens[0]) {
++                rank = i;
++                break;
++            };
++            miss_rank[rank] += 1;
++        }
++        if (acct.rounds % 128 == 127) std.log.warn("MISSRANK {any}", .{miss_rank});
++        {
++            var t: std.c.timespec = undefined;
++            _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &t);
++            const now = @as(f64, @floatFromInt(t.sec)) + @as(f64, @floatFromInt(t.nsec)) * 1e-9;
++            if (acct.last != 0 and now - acct.last < 0.2) acct.wall += now - acct.last;
++            acct.last = now;
++        }
++        if (acct.rounds % 128 == 0) std.log.warn("ACCT rounds={d} landed={d} precise={d} rows={d} round_ms={d:.3}", .{ acct.rounds, acct.landed, acct.precise, acct.rows, acct.wall * 1e3 / @as(f64, @floatFromInt(acct.rounds - 1)) });
+         var landed: u32 = 0;
+         for (accepted.path) |row| landed += @intFromBool(row >= drafted.len);
+         const tokens = try g.allocator.dupe(u32, accepted.tokens);
+diff --git a/Vendor/TensorFold/zig/src/families/qwen27/dflash/selector.zig b/Vendor/TensorFold/zig/src/families/qwen27/dflash/selector.zig
+index 095326a..bbb0623 100644
+--- a/Vendor/TensorFold/zig/src/families/qwen27/dflash/selector.zig
++++ b/Vendor/TensorFold/zig/src/families/qwen27/dflash/selector.zig
+@@ -188,8 +188,10 @@ fn expand(g: *const weights.Graph, lattice: op.Lattice, options: Options, first:
+         }
+     }
+ }
++pub var last_candidates: [16]u32 = @splat(0xffffffff);
+ pub fn propose(gpa: std.mem.Allocator, g: *const weights.Graph, lattice: op.Lattice, anchor: u32, first_position: u64, options: Options) !Tree {
+     try g.config.check();
++    for (0..@min(16, lattice.topk)) |i| last_candidates[i] = if (lattice.candidates.len > i) lattice.candidates[i] else 0xffffffff;
+     for ([_]weights.Tensor{ g.predecessor, g.successor }) |t| if (t.dtype != .bf16 or t.rank != 2 or t.shape[0] != g.config.vocab or t.shape[1] != g.config.rank) return error.DraftCodebookShape;
+     try lattice.check(g.config);
+     if (anchor >= g.config.vocab or options.nodes > 32 or options.children == 0 or options.children > 16 or lattice.topk > 16 or !std.math.isFinite(options.tau) or options.tau <= 0 or !std.math.isFinite(options.edge) or !std.math.isFinite(options.noise_weight) or !std.math.isFinite(options.temperature) or options.temperature <= 0 or !(options.floor >= 0 and options.floor < 1)) return error.BadDraftSelector;

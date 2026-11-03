@@ -1,0 +1,294 @@
+diff --git a/Vendor/TensorFold/zig/kernels/metal/core/lane_gu_lockstep.metal b/Vendor/TensorFold/zig/kernels/metal/core/lane_gu_lockstep.metal
+index 0d17b6e..d1bee79 100644
+--- a/Vendor/TensorFold/zig/kernels/metal/core/lane_gu_lockstep.metal
++++ b/Vendor/TensorFold/zig/kernels/metal/core/lane_gu_lockstep.metal
+@@ -3,6 +3,9 @@
+ kernel void tf_lane_lockstep(const device bfloat* X [[buffer(0)]],const device uint4* W [[buffer(1)]],const device bfloat* SB [[buffer(2)]],const device int* mdims [[buffer(3)]],device bfloat* Y [[buffer(4)]],const device float* XS [[buffer(5)]],device float* HS [[buffer(6)]],
+ #if defined(TF_GU_COUNT)
+  device atomic_uint* GC [[buffer(7)]],
++#endif
++#if defined(TF_GU_WAIT)
++ device atomic_uint* WC [[buffer(8)]],constant uint& wait_for [[buffer(9)]],uint2 tgs [[threadgroups_per_grid]],
+ #endif
+  uint sgi [[simdgroup_index_in_threadgroup]],uint lanei [[thread_index_in_simdgroup]],uint2 tg [[threadgroup_position_in_grid]]){
+  const int lane=int(lanei),ks=int(sgi),M=min(mdims[0],16),stride=mdims[1];
+@@ -35,6 +38,19 @@ kernel void tf_lane_lockstep(const device bfloat* X [[buffer(0)]],const device u
+   uint3 ni=gi[(size_t)first*(TF_N/8)];
+ #else
+   uint2 ni0=gi[(size_t)first*(TF_N/4)],ni1=gi[(size_t)first*(TF_N/4)+4];
++#endif
++#if defined(TF_GU_WAIT)
++  // X and XS come from the post norm in this launch's barrier interval, whose row threadgroups count themselves on WC[0]
++  // past a device-scope fence: with the first group's codes and indices in flight, thread 0 waits on the count (bounded)
++  // and passes its own fence before any row is read; the last threadgroup to arrive leaves both words zero
++  if(split==0){
++   if(ks==0&&lane==0){
++    for(uint spin=0;spin<(1u<<24)&&atomic_load_explicit(&WC[0],memory_order_relaxed)<wait_for;spin++){}
++    atomic_thread_fence(mem_flags::mem_device,memory_order_seq_cst,thread_scope_device);
++    if(atomic_fetch_add_explicit(&WC[1],1u,memory_order_relaxed)+1u==tgs.x*tgs.y){atomic_store_explicit(&WC[0],0u,memory_order_relaxed);atomic_store_explicit(&WC[1],0u,memory_order_relaxed);}
++   }
++   threadgroup_barrier(mem_flags::mem_threadgroup);
++  }
+ #endif
+   for(int g=first;g<last;g++){
+    const float x0=XS[g*stride+mb];
+diff --git a/Vendor/TensorFold/zig/kernels/metal/qwen27/norm_xs.metal b/Vendor/TensorFold/zig/kernels/metal/qwen27/norm_xs.metal
+index 9fdfee8..7a4a78b 100644
+--- a/Vendor/TensorFold/zig/kernels/metal/qwen27/norm_xs.metal
++++ b/Vendor/TensorFold/zig/kernels/metal/qwen27/norm_xs.metal
+@@ -14,6 +14,8 @@ typedef half float16_t;
+   device float* XS [[buffer(7)]],
+   device atomic_uint* NC [[buffer(8)]],
+   constant uint& wait_for [[buffer(9)]],
++  device atomic_uint* OC [[buffer(10)]],
++  constant uint& count_out [[buffer(11)]],
+   uint simdgroup_index_in_threadgroup [[simdgroup_index_in_threadgroup]],
+   uint thread_index_in_simdgroup [[thread_index_in_simdgroup]],
+   uint3 thread_position_in_threadgroup [[thread_position_in_threadgroup]],
+@@ -96,5 +98,13 @@ Q27_SPECIALIZE
+     gs = simd_shuffle(gs, ushort((thread_index_in_simdgroup & ~3u) | turn));
+   }
+   if ((t & 3) == 0) XS[(t >> 2) * MP + m] = gs;
+-
++  // count_out above 0: the decoded gate/up that reads XO and XS shares this launch's barrier interval and waits on OC[0],
++  // which each row's threadgroup adds to once its stores (row 0's padded sums included) are past a device-scope fence
++  if (count_out != 0u) {
++    threadgroup_barrier(mem_flags::mem_device);
++    if (t == 0) {
++      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
++      atomic_fetch_add_explicit(&OC[0], 1u, memory_order_relaxed);
++    }
++  }
+ }
+diff --git a/Vendor/TensorFold/zig/src/core/lane_projection.zig b/Vendor/TensorFold/zig/src/core/lane_projection.zig
+index 3dc6637..7f4c2b4 100644
+--- a/Vendor/TensorFold/zig/src/core/lane_projection.zig
++++ b/Vendor/TensorFold/zig/src/core/lane_projection.zig
+@@ -211,6 +211,9 @@ pub const Layout = struct {
+     /// The decoded indexed gate/up's lockstep launch counts its threadgroups the same way once its activated rows and
+     /// their group sums are stored, for the MLP down that waits on that count (encodeSwigluCounted).
+     gu_count: bool = false,
++    /// A gu_count launch that also waits, before it reads its input rows and sums, on the post norm's row count in the same
++    /// barrier interval (encodeSwigluCountedAfter).
++    gu_wait: bool = false,
+     /// A counted decoded launch that also waits, before it reads its input rows and sums, on its producer's count in the
+     /// same barrier interval (encodeCountedAfter).
+     wait: bool = false,
+@@ -247,6 +250,7 @@ pub const Layout = struct {
+         if (l.residual and (l.prompt_tn == 1 or l.swiglu or l.output != .bf16 or l.groups != null)) return error.InvalidSchedule;
+         if (l.count and (!l.reg or !l.rows8 or l.swiglu or l.residual or l.prompt_tn != 1 or l.groups != null)) return error.InvalidSchedule;
+         if (l.gu_count and !lockstepGu(l)) return error.InvalidSchedule;
++        if (l.gu_wait and !l.gu_count) return error.InvalidSchedule;
+         if (l.wait and (!l.count or !l.reg_lean or l.prompt_sr or l.serial_sk2)) return error.InvalidSchedule;
+         const g = l.groupCut();
+         if (g[1] == 0 or g[0] >= l.k / l.format.group or g[1] > l.k / l.format.group - g[0]) return error.InvalidGroupCut;
+@@ -348,6 +352,7 @@ pub fn source(a: std.mem.Allocator, l: Layout) ![]u8 {
+     if (l.residual) try text.appendSlice(a, "#define TF_RESID 1\n");
+     if (l.count) try text.appendSlice(a, "#define TF_COUNT 1\n");
+     if (l.gu_count) try text.appendSlice(a, "#define TF_GU_COUNT 1\n");
++    if (l.gu_wait) try text.appendSlice(a, "#define TF_GU_WAIT 1\n");
+     if (l.wait) try text.appendSlice(a, "#define TF_WAIT 1\n");
+     if (l.tile_list) try text.appendSlice(a, "#define TF_TILE_LIST 1\n");
+     if (l.indexed) try text.print(a, "#define TF_SBI {d}\n", .{@as(usize, if (l.indexed12) sb_table12 else sb_table)});
+@@ -496,6 +501,8 @@ pub const Projection = struct {
+     count: bool = false,
+     /// Built with Layout.gu_count: encodeSwigluCounted only.
+     gu_count: bool = false,
++    /// Built with Layout.gu_wait: encodeSwigluCountedAfter only.
++    gu_wait: bool = false,
+     /// Built with Layout.wait: encodeCountedAfter only.
+     wait: bool = false,
+     /// Built with Layout.tile_list: encodeTiles only.
+@@ -521,7 +528,7 @@ pub const Projection = struct {
+             errdefer sums_pipe.?.deinit();
+             sums_buffer = try device.buffer(@as(usize, if (l.reg) reg_rows else 16) * (l.k / l.format.group) * 4, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+         }
+-        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = if (l.indexed12) indexed12Bytes(l.n, l.k, l.format.group) else if (l.indexed) indexedBytes(l.n, l.k, l.format.group) else l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles() / l.prompt_tn, .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .rows8 = l.rows8, .swiglu = l.swiglu, .swiglu_threads = if (l.prompt_tn == 2 or l.rows8) 64 else 128, .residual = l.residual, .count = l.count, .gu_count = l.gu_count, .wait = l.wait, .tile_list = l.tile_list };
++        return .{ .pipe = p, .n = l.n, .k = l.k, .group_count = l.k / l.format.group, .weight_bytes = l.weightWords() * 4, .metadata_bytes = if (l.indexed12) indexed12Bytes(l.n, l.k, l.format.group) else if (l.indexed) indexedBytes(l.n, l.k, l.format.group) else l.metadataElements() * 2, .output_bytes = if (l.output == .f32) 4 else 2, .y_stride = l.y_stride orelse l.n, .tile_count = l.tiles() / l.prompt_tn, .sk = physical_sk, .sums_pipe = sums_pipe, .sums_buffer = sums_buffer, .threads_per_slice = if (l.cooperative) 64 else 32, .reg = l.reg, .rows8 = l.rows8, .swiglu = l.swiglu, .swiglu_threads = if (l.prompt_tn == 2 or l.rows8) 64 else 128, .residual = l.residual, .count = l.count, .gu_count = l.gu_count, .gu_wait = l.gu_wait, .wait = l.wait, .tile_list = l.tile_list };
+     }
+ 
+     pub fn deinit(p: Projection) void {
+@@ -600,12 +607,24 @@ pub const Projection = struct {
+     /// encodeSwiglu on a Layout.gu_count build: each threadgroup adds one to `counter` (the first of two u32 words, both
+     /// left zero by the waiting launch) once its rows and sums are stored; returns the launch's threadgroups.
+     pub fn encodeSwigluCounted(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, h: Ref, hs: Ref, rows: u32, counter: Ref) !u32 {
+-        if (!p.gu_count or !p.rows8) return error.InvalidSchedule;
++        if (!p.gu_count or p.gu_wait or !p.rows8) return error.InvalidSchedule;
+         try checkRef(counter, 8, 4);
+         try p.encodeSwigluImpl(e, x, w, sb, sums, h, hs, rows, counter);
+         return @intCast(p.n / 128);
+     }
+ 
++    /// encodeSwigluCounted whose threadgroups first wait until `waited` (two u32 words: the post norm's row count, and the
++    /// arrivals this launch leaves zero) reaches `wait_for`: the norm that writes `x` and `sums` shares this barrier interval.
++    pub fn encodeSwigluCountedAfter(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, h: Ref, hs: Ref, rows: u32, counter: Ref, waited: Ref, wait_for: u32) !u32 {
++        if (!p.gu_count or !p.gu_wait or !p.rows8 or wait_for == 0) return error.InvalidSchedule;
++        try checkRef(counter, 8, 4);
++        try checkRef(waited, 8, 4);
++        e.setBuffer(waited.buf, waited.off, 8);
++        e.setValue(wait_for, 9);
++        try p.encodeSwigluImpl(e, x, w, sb, sums, h, hs, rows, counter);
++        return @intCast(p.n / 128);
++    }
++
+     fn encodeSwigluImpl(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, sums: Sums, h: Ref, hs: Ref, rows: u32, counter: ?Ref) !void {
+         if (!p.swiglu) return error.InvalidSchedule;
+         if (rows == 0 or rows > @as(u32, if (p.rows8) 8 else reg_rows) or sums.stride < rows) return error.InvalidRows;
+diff --git a/Vendor/TensorFold/zig/src/families/qwen27/forward.zig b/Vendor/TensorFold/zig/src/families/qwen27/forward.zig
+index 04709ca..541f09f 100644
+--- a/Vendor/TensorFold/zig/src/families/qwen27/forward.zig
++++ b/Vendor/TensorFold/zig/src/families/qwen27/forward.zig
+@@ -95,6 +95,7 @@ pub const Stages = struct {
+         const m = s.model;
+         const f = &m.frame;
+         const e = lane.enc;
++        var gu_after: ?u32 = null; // the post norm's row count the decoded gate/up waits on (normAfterCounting)
+         const layer = m.weights.layers[index];
+         const h: u32 = @intCast(m.config.hidden);
+         const out = switch (layer.mixer) {
+@@ -119,14 +120,17 @@ pub const Stages = struct {
+             e.barrier();
+             try m.kernels.norm(e, s.residual, null, wts.ref(layer.post_norm), f.get(.eps), dims, s.residual, f.get(.input), f.get(.sums), h, s.rows);
+         } else if (if (gated and !s.compact) try m.kernels.quantCounted(e, out, mixer_out, sums(f, .sums, s.rows), f.get(.output), s.rows) else null) |counted| {
+-            // decoded rows: the norm shares the projection's barrier interval and waits on its counted threadgroups
+-            try m.kernels.normAfter(e, s.hidden, f.get(.output), wts.ref(layer.post_norm), f.get(.eps), dims, s.residual, f.get(.input), f.get(.sums), h, s.rows, counted);
++            // decoded rows: the norm shares the projection's barrier interval and waits on its counted threadgroups; where
++            // the counted gate/up follows, the norm counts its rows too and the gate/up waits on them in the same interval
++            if (m.kernels.gateUpEligible(layer.gu, layer.down, s.rows)) {
++                gu_after = try m.kernels.normAfterCounting(e, s.hidden, f.get(.output), wts.ref(layer.post_norm), f.get(.eps), dims, s.residual, f.get(.input), f.get(.sums), h, s.rows, counted);
++            } else try m.kernels.normAfter(e, s.hidden, f.get(.output), wts.ref(layer.post_norm), f.get(.eps), dims, s.residual, f.get(.input), f.get(.sums), h, s.rows, counted);
+         } else {
+             try m.kernels.quant(e, out, mixer_out, if (gated and !s.compact) sums(f, .sums, s.rows) else null, dims, f.get(.output), s.rows);
+             e.barrier();
+             try m.kernels.norm(e, s.hidden, f.get(.output), wts.ref(layer.post_norm), f.get(.eps), dims, s.residual, f.get(.input), f.get(.sums), h, s.rows);
+         }
+-        e.barrier();
++        if (gu_after == null) e.barrier();
+         std.mem.swap(Ref, &s.hidden, &s.residual);
+         var up = f.get(.mixed);
+         up.offset += @as(usize, m.config.intermediate) * 2;
+@@ -156,7 +160,8 @@ pub const Stages = struct {
+             return;
+         }
+         // decoded rows: a counted gate/up shares its barrier interval with the counted down that waits on it
+-        const gu_wait: ?u32 = if (!s.compact) try m.kernels.gateUpCounted(e, layer.gu, layer.down, f.get(.input), sums(f, .sums, s.rows), f.get(.activated), f.get(.act_sums), s.rows) else null;
++        const gu_wait: ?u32 = if (!s.compact) try m.kernels.gateUpCounted(e, layer.gu, layer.down, f.get(.input), sums(f, .sums, s.rows), f.get(.activated), f.get(.act_sums), s.rows, gu_after) else null;
++        if (gu_after != null and gu_wait == null) return error.BadGateUpWait;
+         if (gu_wait == null) {
+             if (!try m.kernels.gateUpActivated(e, layer.gu, f.get(.input), sums(f, .sums, s.rows), f.get(.activated), f.get(.act_sums), s.rows)) {
+                 try m.kernels.quant(e, layer.gu, f.get(.input), sums(f, .sums, s.rows), dims, f.get(.mixed), s.rows);
+diff --git a/Vendor/TensorFold/zig/src/families/qwen27/quant_gpu.zig b/Vendor/TensorFold/zig/src/families/qwen27/quant_gpu.zig
+index a0a2236..bac3ecd 100644
+--- a/Vendor/TensorFold/zig/src/families/qwen27/quant_gpu.zig
++++ b/Vendor/TensorFold/zig/src/families/qwen27/quant_gpu.zig
+@@ -10,7 +10,7 @@ pub const Ref = projection.Ref;
+ /// Group sums the input's producer wrote: XS[group * stride + row], in the lane projection's order.
+ pub const Sums = struct { ref: Ref, stride: u32 };
+ 
+-const Key = struct { kind: Kind, n: u32 = 0, k: u32, slices: u32 = 0, tile: u32 = 0, tmr: u32 = 0, edge: bool = false, skip: u32 = 0, cut: [2]u32 = .{ 0, 0 }, range: [2]u32 = .{ 0, 0 }, bits: u8 = 4, group: u32 = 64, rows8: bool = false, lean: bool = false, prompt_sr: bool = false, batch: u32 = 1, swiglu: bool = false, sbi: bool = false, sbi12: bool = false, resid: bool = false, count: bool = false, wait: bool = false, tiles: u32 = 0,
++const Key = struct { kind: Kind, n: u32 = 0, k: u32, slices: u32 = 0, tile: u32 = 0, tmr: u32 = 0, edge: bool = false, skip: u32 = 0, cut: [2]u32 = .{ 0, 0 }, range: [2]u32 = .{ 0, 0 }, bits: u8 = 4, group: u32 = 64, rows8: bool = false, lean: bool = false, prompt_sr: bool = false, batch: u32 = 1, swiglu: bool = false, sbi: bool = false, sbi12: bool = false, resid: bool = false, count: bool = false, wait: bool = false, gu_wait: bool = false, tiles: u32 = 0,
+ 
+     /// The decode projections run as serial K chains: fused gate/up (34816), GDN qkv (10240) and attention query+gate
+     /// (12288) with K split 2, and decoded rows' GDN z|b|a (6240) with K split 4.
+@@ -77,6 +77,8 @@ pub const Kernels = struct {
+     count_words: ?mtl.Buffer = null,
+     /// The decoded gate/up's count and the waiting down's arrivals (encodeSwigluCounted / encodeCountedAfter), left zero.
+     gu_words: ?mtl.Buffer = null,
++    /// The decoded post norm's row count and the waiting gate/up's arrivals (normAfterCounting / gateUpCounted), left zero.
++    ng_words: ?mtl.Buffer = null,
+ 
+     pub fn setResident(k: *Kernels, hook: ?mtl.ResidencySet.Follow) void {
+         var it = k.lanes.valueIterator();
+@@ -104,6 +106,7 @@ pub const Kernels = struct {
+         k.lanes.deinit(k.allocator);
+         if (k.count_words) |b| b.deinit();
+         if (k.gu_words) |b| b.deinit();
++        if (k.ng_words) |b| b.deinit();
+         var it = k.cache.valueIterator();
+         while (it.next()) |p| p.deinit();
+         k.cache.deinit(k.allocator);
+@@ -541,6 +544,8 @@ pub const Kernels = struct {
+             bind(e, .{ h, r, weight, eps, dims, combined, out, xs });
+             bindAt(e, out, 8); // never read: wait_for 0
+             e.setValue(@as(u32, 0), 9);
++            bindAt(e, out, 10); // never written: count_out 0
++            e.setValue(@as(u32, 0), 11);
+         } else bind(e, .{ h, weight, eps, dims, out, xs });
+         e.dispatchGroups(mtl.Size.of(1, rows, 1), mtl.Size.of(width / 16, 1, 1));
+         try span.end();
+@@ -559,10 +564,46 @@ pub const Kernels = struct {
+         bind(e, .{ h, residual, weight, eps, dims, combined, out, xs });
+         e.setBuffer(words, 0, 8);
+         e.setValue(wait_for, 9);
++        e.setBuffer(words, 0, 10); // never written: count_out 0
++        e.setValue(@as(u32, 0), 11);
+         e.dispatchGroups(mtl.Size.of(1, rows, 1), mtl.Size.of(width / 16, 1, 1));
+         try span.end();
+     }
+ 
++    /// normAfter whose row threadgroups also count themselves on ng_words once their stores are fenced, for the decoded
++    /// gate/up that waits on that count in the same barrier interval (gateUpCounted with `after`); returns that count.
++    pub fn normAfterCounting(k: *Kernels, input_encoder: mtl.ComputeEncoder, h: Ref, residual: Ref, weight: Ref, eps: Ref, dims: Ref, combined: Ref, out: Ref, xs: Ref, width: u32, rows: u32, wait_for: u32) !u32 {
++        const words = k.count_words orelse return error.BadCoreProjectionRows;
++        if (wait_for == 0 or rows == 0 or rows > 8) return error.BadCoreProjectionRows;
++        try wordAligned(.{ h, residual, weight, combined, out });
++        if (k.ng_words == null) {
++            const b = try k.device.buffer(8, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
++            @memset(b.contents()[0..8], 0);
++            k.ng_words = b;
++        }
++        var span = profile.begin(k.profiler, input_encoder, .norm);
++        errdefer span.cancel();
++        const e = span.encoder;
++        e.setPipeline(try k.get(.{ .kind = .norm, .k = width }));
++        bind(e, .{ h, residual, weight, eps, dims, combined, out, xs });
++        e.setBuffer(words, 0, 8);
++        e.setValue(wait_for, 9);
++        e.setBuffer(k.ng_words.?, 0, 10);
++        e.setValue(@as(u32, 1), 11);
++        e.dispatchGroups(mtl.Size.of(1, rows, 1), mtl.Size.of(width / 16, 1, 1));
++        try span.end();
++        return rows;
++    }
++
++    /// Whether gateUpCounted takes this gate/up and down for `rows` decoded rows.
++    pub fn gateUpEligible(k: *const Kernels, p: projection.Linear, down: projection.Linear, rows: u32) bool {
++        if (k.prompt or rows == 0 or rows > 8 or p.runs.len > 0 or p.raw != null or p.tile != 32) return false;
++        if (p.bits != 4 or p.group != 64 or p.n != 34816 or p.k != 5120 or p.batch != 8 or p.index == null) return false;
++        if (k.countedKey(down, rows, true) == null) return false;
++        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = p.slices, .bits = p.bits, .group = p.group, .rows8 = true, .lean = true, .batch = p.batch, .swiglu = true, .sbi = true, .sbi12 = p.index12, .count = true };
++        return key.serialSk2();
++    }
++
+     /// `quant` of decoded rows (at most 8, given sums, a parallel K split) whose threadgroups count themselves once their
+     /// stores are fenced (Layout.count), for a normAfter in the same barrier interval. Returns that norm's wait (the
+     /// launch's threadgroups); null: nothing encoded, the caller takes quant.
+@@ -631,12 +672,13 @@ pub const Kernels = struct {
+     /// Decoded rows: the fused gate/up's lockstep launch (gateUpActivated's) counting its threadgroups once its activated
+     /// rows and their group sums are stored, when `down` takes the counted launch that waits on them in the same barrier
+     /// interval (quantCountedAfter); null (nothing encoded) otherwise.
+-    pub fn gateUpCounted(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, down: projection.Linear, x: Ref, xs: Sums, out: Ref, out_sums: Ref, rows: u32) !?u32 {
++    pub fn gateUpCounted(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, down: projection.Linear, x: Ref, xs: Sums, out: Ref, out_sums: Ref, rows: u32, after: ?u32) !?u32 {
+         if (k.prompt or rows == 0 or rows > 8 or p.runs.len > 0 or p.raw != null or p.tile != 32) return null;
+         if (p.bits != 4 or p.group != 64 or p.n != 34816 or p.k != 5120 or p.batch != 8 or p.index == null) return null;
+         if (k.countedKey(down, rows, true) == null) return null;
+-        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = p.slices, .bits = p.bits, .group = p.group, .rows8 = true, .lean = true, .batch = p.batch, .swiglu = true, .sbi = true, .sbi12 = p.index12, .count = true };
++        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = p.slices, .bits = p.bits, .group = p.group, .rows8 = true, .lean = true, .batch = p.batch, .swiglu = true, .sbi = true, .sbi12 = p.index12, .count = true, .gu_wait = after != null };
+         if (!key.serialSk2()) return null;
++        if (after != null and k.ng_words == null) return error.BadCoreProjectionRows;
+         if (k.gu_words == null) {
+             const b = try k.device.buffer(8, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+             @memset(b.contents()[0..8], 0);
+@@ -648,10 +690,10 @@ pub const Kernels = struct {
+         const entry = try k.lanes.getOrPut(k.allocator, key);
+         if (!entry.found_existing) {
+             errdefer _ = k.lanes.remove(key);
+-            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .precompute_sums = true, .reg = true, .serial_sk2 = true, .tile_batch = key.batch, .rows8 = true, .reg_lean = true, .swiglu = true, .indexed = true, .indexed12 = key.sbi12, .gu_count = true });
++            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .precompute_sums = true, .reg = true, .serial_sk2 = true, .tile_batch = key.batch, .rows8 = true, .reg_lean = true, .swiglu = true, .indexed = true, .indexed12 = key.sbi12, .gu_count = true, .gu_wait = after != null });
+             k.joined(entry.value_ptr);
+         }
+-        const n = try entry.value_ptr.encodeSwigluCounted(span.encoder, .{ .buf = x.buffer, .off = x.offset }, .{ .buf = p.words.buffer, .off = p.words.offset }, metadata(p, true), .{ .ref = .{ .buf = xs.ref.buffer, .off = xs.ref.offset }, .stride = xs.stride }, .{ .buf = out.buffer, .off = out.offset }, .{ .buf = out_sums.buffer, .off = out_sums.offset }, rows, .{ .buf = k.gu_words.? });
++        const n = if (after) |wait_for| try entry.value_ptr.encodeSwigluCountedAfter(span.encoder, .{ .buf = x.buffer, .off = x.offset }, .{ .buf = p.words.buffer, .off = p.words.offset }, metadata(p, true), .{ .ref = .{ .buf = xs.ref.buffer, .off = xs.ref.offset }, .stride = xs.stride }, .{ .buf = out.buffer, .off = out.offset }, .{ .buf = out_sums.buffer, .off = out_sums.offset }, rows, .{ .buf = k.gu_words.? }, .{ .buf = k.ng_words.? }, wait_for) else try entry.value_ptr.encodeSwigluCounted(span.encoder, .{ .buf = x.buffer, .off = x.offset }, .{ .buf = p.words.buffer, .off = p.words.offset }, metadata(p, true), .{ .ref = .{ .buf = xs.ref.buffer, .off = xs.ref.offset }, .stride = xs.stride }, .{ .buf = out.buffer, .off = out.offset }, .{ .buf = out_sums.buffer, .off = out_sums.offset }, rows, .{ .buf = k.gu_words.? });
+         try span.end();
+         return n;
+     }

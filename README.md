@@ -29,7 +29,10 @@ of my TensorFold fork.
 | 7 | Four-column prompt DeltaNet scan ([patch](patches/07-four-column-prompt-scan.patch)) | b490cd9f | prompt scan 4 columns a lane | in `631553ae` 1.71545; carried in `c1d09a0f` and every leader since |
 | 8 | Eight-part sparse decode attention prefixes ([patch](patches/08-eight-part-decode-prefix.patch)) | c153ffc9 / 292d7fda | dec +0.12% (5 rounds) | in `da328474`, `254ee549` |
 | 9 | Sibling floor 0.02, calibrated on independent prompts ([patch](patches/09-sibling-floor-0.02.patch)) | 292d7fda | dec +0.10% (5 rounds) | in `da328474` |
-| 10 | Drafter MLP down projection on its 2-bit copy ([patch](patches/10-drafter-down-on-2-bits.patch)) | a5b756b6 | dec +0.61%; with 8: +0.85% | in `254ee549` |
+| 10 | Drafter MLP down projection on its 2-bit copy ([patch](patches/10-drafter-down-on-2-bits.patch)) | a5b756b6 | dec +0.61%; with 8: +0.85% | in `bf5555a3` 1.75523 (official −1.4% vs its base: did not transfer) |
+| 11 | Siblings stop once the offered drafter mass reaches 0.95 ([patch](patches/11-sibling-mass-stop-0.95.patch)) | cb4d3130 | rows −1.5%, dec +0.05% | null on `22b390be` |
+| 12 | Keep settle waits on its own shared event ([patch](patches/12-keep-event-settle.patch)) | cb4d3130 + 11 | −7 µs a round | not submitted |
+| 13 | Two-state first round: catch-up staged beside round 1's verify ([patch](patches/13-two-state-first-round.patch)) | cb4d3130 + 11 | round 1 −1.2 ms, no tokens lost | not submitted |
 
 Notes on what each one changes:
 
@@ -55,6 +58,21 @@ Notes on what each one changes:
     projections are bandwidth-bound, so down on its 2-bit copy shortens the drafter frame (~449 to ~300 us) for a small
     acceptance cost. Checked on three independent prompts (+0.2 to +0.35%). A least-squares refit of the 2-bit copies
     ([negative patch](patches/x1-drafter-lloyd-refit-NEGATIVE.patch)) lowered weight error but halved the gain.
+
+## Endgame (2–3 Nov): why we stopped
+
+The frontier reached 1.79565 (`22b390be`), which makes the bar 1.80912. Our best exact build sat at about 1.789–1.7925.
+Nothing was filed. [`notes/endgame-findings.md`](notes/endgame-findings.md) covers what was measured on the way. In short:
+
+- The GPU is busy ~99.7% of a decode round. Host gaps are ~90 µs, and the rest is kernel time.
+- On M5 Max, overlapping work with the verify doesn't hide it: a second-queue append and a staged prompt catch-up both
+  give back almost everything to contention.
+- The drafter's 9.4 ms prompt catch-up sits in every official sample (~0.4% of the decode leg). Local 1024-token windows
+  dilute it 8×.
+- Depth-1 sibling selection is at its optimum. The remaining misses need information the pinned drafter doesn't have.
+- Changing a projection's K split breaks exactness. Five stagger segments gain locally but not on the official runner.
+- New tools ([`tools/`](tools)), microbenchmarks ([`microbench/`](microbench)), negative results
+  ([`patches/negative/`](patches/negative)) and diagnostic patches ([`patches/diagnostic/`](patches/diagnostic)).
 
 ## Measurement finds
 
@@ -88,10 +106,11 @@ The full write-up, with a table of 22 dead ends, is in [`notes/measurements.md`]
 | [`c903ef78`](notes/yukon-submission-c903ef78-note.md) | `7a2d34f1` + three ported pieces (composition only) | — | runner fault, no score |
 | [`631553ae`](notes/yukon-submission-631553ae-note.md) | `b490cd9f` + 6691 attention + 7 | 1.71545 | rejected; 7 carried by `c1d09a0f` (promoted) |
 | [`da328474`](notes/yukon-submission-da328474-note.md) | `292d7fda` + 8 + 9 | 1.74109 | rejected (laptop-1 box) |
-| [`254ee549`](notes/yukon-submission-254ee549-note.md) | `a5b756b6` + 10 + 8 | — | validating |
+| [`254ee549`](notes/yukon-submission-254ee549-note.md) | `a5b756b6` + 10 + 8 | — | cancelled; refiled as `bf5555a3` |
+| `bf5555a3` | `a5b756b6` + 10 + 8 | 1.75523 | rejected |
 
 ## Attribution
 
 This work builds on public submissions to the same challenge and on upstream TensorFold (Apache-2.0). Ported or built-upon work
 is named where used: terrapinelf, e-man07, kshitij-hash, fkiene, ercumentyildirim, ArthurOstapenko, GordoAR, i34-9, jungjipdo, a-github-name, otarkhan, mrv777,
-akki-rock05 (CUDA drafter refit idea) and the TensorFold authors. Each submission note lists its exact dependencies.
+akki-rock05 (CUDA drafter refit idea), kaankolcu and the TensorFold authors. Each submission note lists its exact dependencies.

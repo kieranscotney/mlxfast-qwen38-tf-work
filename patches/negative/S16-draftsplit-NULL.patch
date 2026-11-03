@@ -1,0 +1,57 @@
+diff --git a/Vendor/TensorFold/zig/src/families/qwen27/dflash/runtime_backend.zig b/Vendor/TensorFold/zig/src/families/qwen27/dflash/runtime_backend.zig
+index f189704..6d60f2c 100644
+--- a/Vendor/TensorFold/zig/src/families/qwen27/dflash/runtime_backend.zig
++++ b/Vendor/TensorFold/zig/src/families/qwen27/dflash/runtime_backend.zig
+@@ -317,7 +317,7 @@ pub const Backend = struct {
+             try st.put(b.allocator, owned, .{ .prepared = dup, .key = key });
+         };
+         if (order) |o| {
+-            const adapter = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, prepared_words, try @import("../projection.zig").split(shape[0], shape[1]), o);
++            const adapter = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, prepared_words, try @import("../projection.zig").draftSplit(shape[0], shape[1], prepared_words.bits), o);
+             try @import("../residency.zig").putPrepared(b, key, adapter);
+             // a linear drafted below 4 bits keeps its q4 copy too, for frames drafted precise
+             if (bits != 4) {
+@@ -405,7 +405,7 @@ pub const Backend = struct {
+         }
+         const key = (st.get(try std.fmt.bufPrint(&buf, "{d}{c}", .{ layer, key_part })).?).key + kind;
+         const joined = core.affine4.Prepared{ .allocator = b.allocator, .n = n, .k = k, .words = words, .scales = scales, .biases = biases, .bits = bits, .group = size, .nibbles = nibbles };
+-        const adapter = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, joined, try @import("../projection.zig").split(n, k), order);
++        const adapter = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, joined, try @import("../projection.zig").draftSplit(n, k, bits), order);
+         try @import("../residency.zig").putPrepared(b, key, adapter);
+         b.fused_count += 1;
+     }
+diff --git a/Vendor/TensorFold/zig/src/families/qwen27/dflash/runtime_head.zig b/Vendor/TensorFold/zig/src/families/qwen27/dflash/runtime_head.zig
+index 735af0f..58743a2 100644
+--- a/Vendor/TensorFold/zig/src/families/qwen27/dflash/runtime_head.zig
++++ b/Vendor/TensorFold/zig/src/families/qwen27/dflash/runtime_head.zig
+@@ -172,7 +172,7 @@ pub const Head = struct {
+         defer p.deinit();
+         const order = if (reg) try lane.RegOrder.init(device) else null;
+         defer if (order) |o| o.deinit();
+-        h.plain = try core.affine4_lane.Adapter.init(a, device, p, try projection.split(width, k), order);
++        h.plain = try core.affine4_lane.Adapter.init(a, device, p, try projection.draftSplit(width, k, p.bits), order);
+     }
+     /// The spans' rows of `name` ([rows][row_bytes] in the checkpoint), packed in span order into `out`.
+     fn spanRows(ck: *const @import("core").checkpoint_metal.Checkpoint, name: []const u8, rows: usize, row_bytes: usize, out: []u8) !void {
+diff --git a/Vendor/TensorFold/zig/src/families/qwen27/projection.zig b/Vendor/TensorFold/zig/src/families/qwen27/projection.zig
+index 8fb7c23..c882534 100644
+--- a/Vendor/TensorFold/zig/src/families/qwen27/projection.zig
++++ b/Vendor/TensorFold/zig/src/families/qwen27/projection.zig
+@@ -19,6 +19,17 @@ pub fn split(n: usize, k: usize) !u32 {
+     return slices;
+ }
+ 
++/// K splits for the drafter's linears below 4 bits: their codes are half the bytes a group for the same unpack and
++/// tensor-op work, so one SIMD group a tile cannot keep enough of the stream in flight; up to 4096 SIMD groups a launch
++/// and 4 groups a chain. 4-bit linears keep `split`. Only drafter launches take it: their sums are the drafts' only.
++pub fn draftSplit(n: usize, k: usize, bits: u8) !u32 {
++    if (bits >= 4) return split(n, k);
++    if (n == 0 or k == 0 or n % 4 != 0 or k % 64 != 0) return error.BadProjectionShape;
++    var slices: u32 = 1;
++    while (slices < 8 and (n + 31) / 32 * slices < 4096 and k / 64 / (2 * slices) >= 4) slices *= 2;
++    return slices;
++}
++
+ /// K splits fastest on an M5 Ultra, each shape streamed over every layer's matrix (tf-qwen27-bench QWEN27_DISTINCT).
+ fn m5Split(n: usize, k: usize) ?u32 {
+     const table = [_]struct { n: usize, k: usize, sk: u32 }{ .{ .n = 10240, .k = 5120, .sk = 2 }, .{ .n = 6240, .k = 5120, .sk = 4 }, .{ .n = 5120, .k = 6144, .sk = 4 }, .{ .n = 12288, .k = 5120, .sk = 2 }, .{ .n = 2048, .k = 5120, .sk = 8 }, .{ .n = 5120, .k = 17408, .sk = 4 } };

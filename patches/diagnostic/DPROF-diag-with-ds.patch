@@ -1,0 +1,148 @@
+diff --git a/Vendor/TensorFold/zig/src/families/qwen27/dflash/generation.zig b/Vendor/TensorFold/zig/src/families/qwen27/dflash/generation.zig
+index 7e2378f..47468ad 100644
+--- a/Vendor/TensorFold/zig/src/families/qwen27/dflash/generation.zig
++++ b/Vendor/TensorFold/zig/src/families/qwen27/dflash/generation.zig
+@@ -353,7 +353,7 @@ pub const Generation = struct {
+         try g.finishKeep();
+         // a depth-one round of the drafter's 2-row block: the next round's frame is committed behind this verify, unless a
+         // next round may not follow (its budget may end the run) or either count of kept taps would change its launches
+-        const early = remaining > 2 and (policy.max_depth orelse 0) == 1 and block == 2 and g.proposer == null and extend == null and extra == 0 and eos.len == 0 and g.draft.canPrepare(block);
++        const early = false and remaining > 2 and (policy.max_depth orelse 0) == 1 and block == 2 and g.proposer == null and extend == null and extra == 0 and eos.len == 0 and g.draft.canPrepare(block);
+         // a depth-one round's keep (keepDevice, behind the verify) stashes its GDN rows for the next verifies' star scans
+         g.runner.defer_gdn = (policy.max_depth orelse 0) == 1;
+         defer g.runner.defer_gdn = false;
+diff --git a/Vendor/TensorFold/zig/src/families/qwen27/dflash/runtime_backend.zig b/Vendor/TensorFold/zig/src/families/qwen27/dflash/runtime_backend.zig
+index f189704..877e2fb 100644
+--- a/Vendor/TensorFold/zig/src/families/qwen27/dflash/runtime_backend.zig
++++ b/Vendor/TensorFold/zig/src/families/qwen27/dflash/runtime_backend.zig
+@@ -317,7 +317,7 @@ pub const Backend = struct {
+             try st.put(b.allocator, owned, .{ .prepared = dup, .key = key });
+         };
+         if (order) |o| {
+-            const adapter = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, prepared_words, try @import("../projection.zig").split(shape[0], shape[1]), o);
++            const adapter = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, prepared_words, try @import("../projection.zig").draftSplit(shape[0], shape[1], prepared_words.bits), o);
+             try @import("../residency.zig").putPrepared(b, key, adapter);
+             // a linear drafted below 4 bits keeps its q4 copy too, for frames drafted precise
+             if (bits != 4) {
+@@ -405,7 +405,7 @@ pub const Backend = struct {
+         }
+         const key = (st.get(try std.fmt.bufPrint(&buf, "{d}{c}", .{ layer, key_part })).?).key + kind;
+         const joined = core.affine4.Prepared{ .allocator = b.allocator, .n = n, .k = k, .words = words, .scales = scales, .biases = biases, .bits = bits, .group = size, .nibbles = nibbles };
+-        const adapter = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, joined, try @import("../projection.zig").split(n, k), order);
++        const adapter = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, joined, try @import("../projection.zig").draftSplit(n, k, bits), order);
+         try @import("../residency.zig").putPrepared(b, key, adapter);
+         b.fused_count += 1;
+     }
+@@ -455,7 +455,7 @@ pub const Backend = struct {
+         if (b.failed) return error.DraftBackendFailed;
+         try b.frame.require(epoch);
+         b.frame.ops += 1;
+-        if (b.frame.ops == first_part_ops or b.frame.ops % part_ops == 0) {
++        {
+             const parts = b.frame.part_count;
+             try b.frame.part();
+             if (b.frame.part_count != parts) b.hazards.clear(); // a new encoder behind the fence: nothing open
+@@ -468,7 +468,7 @@ pub const Backend = struct {
+         if (b.failed) return error.DraftBackendFailed;
+         try b.frame.require(epoch);
+         b.frame.ops += 1;
+-        if (b.frame.ops == first_part_ops or b.frame.ops % part_ops == 0) {
++        {
+             const parts = b.frame.part_count;
+             try b.frame.part();
+             if (b.frame.part_count != parts) b.hazards.clear(); // a new encoder behind the fence: nothing open
+diff --git a/Vendor/TensorFold/zig/src/families/qwen27/dflash/runtime_frame.zig b/Vendor/TensorFold/zig/src/families/qwen27/dflash/runtime_frame.zig
+index 5330ec4..620321c 100644
+--- a/Vendor/TensorFold/zig/src/families/qwen27/dflash/runtime_frame.zig
++++ b/Vendor/TensorFold/zig/src/families/qwen27/dflash/runtime_frame.zig
+@@ -109,7 +109,7 @@ pub const Frame = struct {
+     external_id: u64 = 0,
+     external_epoch: u64 = 0,
+     fence: ?mtl.objc.Id = null,
+-    parts: [8]mtl.CommandBuffer = undefined,
++    parts: [192]mtl.CommandBuffer = undefined,
+     part_count: usize = 0,
+     ops: u32 = 0,
+     residency: ?mtl.ResidencySet.Follow = null,
+@@ -119,7 +119,7 @@ pub const Frame = struct {
+     /// are waited for and checked when the next frame begins (checkUnchecked).
+     poll_event: ?mtl.SharedEvent = null,
+     poll_value: u64 = 0,
+-    unchecked: [9]mtl.CommandBuffer = undefined,
++    unchecked: [200]mtl.CommandBuffer = undefined,
+     n_unchecked: usize = 0,
+     pub fn setResident(f: *Frame, hook: ?mtl.ResidencySet.Follow) void {
+         for (f.pool.items) |buffer| {
+@@ -160,11 +160,20 @@ pub const Frame = struct {
+     /// Waits for and checks the command buffers a finished frame returned before they reported completion.
+     pub fn checkUnchecked(f: *Frame) !void {
+         var bad = false;
+-        for (f.unchecked[0..f.n_unchecked]) |cb| {
++        if (f.n_unchecked > 0) dp_frames += 1;
++        for (f.unchecked[0..f.n_unchecked], 0..) |cb, i| {
+             cb.wait();
+             bad = failed(cb) or bad;
++            if (dp_frames > 50 and dp_frames <= 250 and i < 200) { dp_sum[i] += cb.gpuSeconds(); dp_cnt[i] += 1; }
+             cb.release();
+         }
++        if (dp_frames == 250 and f.n_unchecked > 0) {
++            dp_frames += 1;
++            var line: [200]u32 = @splat(0);
++            var total: f64 = 0;
++            for (0..200) |i| if (dp_cnt[i] > 0) { const v = dp_sum[i] / @as(f64, @floatFromInt(dp_cnt[i])); total += v; line[i] = @intFromFloat(v * 1e6); };
++            std.log.warn("DPROF total={d:.1}us parts={d} us={any}", .{ total * 1e6, f.n_unchecked, line[0..f.n_unchecked] });
++        }
+         f.n_unchecked = 0;
+         if (bad) return error.DraftGpuFailure;
+     }
+@@ -202,7 +211,7 @@ pub const Frame = struct {
+     }
+     /// Commits the work so far and opens the next buffer behind a fence, so the GPU starts early; between ops only.
+     pub fn part(f: *Frame) !void {
+-        if (!f.active or f.completed or f.committed or f.early or f.part_count == f.parts.len) return;
++        if (!f.active or f.completed or f.committed or f.part_count == f.parts.len) return;
+         if (f.fence == null) f.fence = mtl.objc.msg(?mtl.objc.Id, f.device.id, "newFence", .{}) orelse return error.NoFence;
+         mtl.objc.msg(void, f.encoder.id, "updateFence:", .{f.fence.?});
+         f.encoder.end();
+@@ -356,3 +365,6 @@ pub const Frame = struct {
+         return view;
+     }
+ };
++var dp_frames: u64 = 0;
++var dp_sum: [200]f64 = @splat(0);
++var dp_cnt: [200]u64 = @splat(0);
+diff --git a/Vendor/TensorFold/zig/src/families/qwen27/dflash/runtime_head.zig b/Vendor/TensorFold/zig/src/families/qwen27/dflash/runtime_head.zig
+index 735af0f..58743a2 100644
+--- a/Vendor/TensorFold/zig/src/families/qwen27/dflash/runtime_head.zig
++++ b/Vendor/TensorFold/zig/src/families/qwen27/dflash/runtime_head.zig
+@@ -172,7 +172,7 @@ pub const Head = struct {
+         defer p.deinit();
+         const order = if (reg) try lane.RegOrder.init(device) else null;
+         defer if (order) |o| o.deinit();
+-        h.plain = try core.affine4_lane.Adapter.init(a, device, p, try projection.split(width, k), order);
++        h.plain = try core.affine4_lane.Adapter.init(a, device, p, try projection.draftSplit(width, k, p.bits), order);
+     }
+     /// The spans' rows of `name` ([rows][row_bytes] in the checkpoint), packed in span order into `out`.
+     fn spanRows(ck: *const @import("core").checkpoint_metal.Checkpoint, name: []const u8, rows: usize, row_bytes: usize, out: []u8) !void {
+diff --git a/Vendor/TensorFold/zig/src/families/qwen27/projection.zig b/Vendor/TensorFold/zig/src/families/qwen27/projection.zig
+index 8fb7c23..c882534 100644
+--- a/Vendor/TensorFold/zig/src/families/qwen27/projection.zig
++++ b/Vendor/TensorFold/zig/src/families/qwen27/projection.zig
+@@ -19,6 +19,17 @@ pub fn split(n: usize, k: usize) !u32 {
+     return slices;
+ }
+ 
++/// K splits for the drafter's linears below 4 bits: their codes are half the bytes a group for the same unpack and
++/// tensor-op work, so one SIMD group a tile cannot keep enough of the stream in flight; up to 4096 SIMD groups a launch
++/// and 4 groups a chain. 4-bit linears keep `split`. Only drafter launches take it: their sums are the drafts' only.
++pub fn draftSplit(n: usize, k: usize, bits: u8) !u32 {
++    if (bits >= 4) return split(n, k);
++    if (n == 0 or k == 0 or n % 4 != 0 or k % 64 != 0) return error.BadProjectionShape;
++    var slices: u32 = 1;
++    while (slices < 8 and (n + 31) / 32 * slices < 4096 and k / 64 / (2 * slices) >= 4) slices *= 2;
++    return slices;
++}
++
+ /// K splits fastest on an M5 Ultra, each shape streamed over every layer's matrix (tf-qwen27-bench QWEN27_DISTINCT).
+ fn m5Split(n: usize, k: usize) ?u32 {
+     const table = [_]struct { n: usize, k: usize, sk: u32 }{ .{ .n = 10240, .k = 5120, .sk = 2 }, .{ .n = 6240, .k = 5120, .sk = 4 }, .{ .n = 5120, .k = 6144, .sk = 4 }, .{ .n = 12288, .k = 5120, .sk = 2 }, .{ .n = 2048, .k = 5120, .sk = 8 }, .{ .n = 5120, .k = 17408, .sk = 4 } };

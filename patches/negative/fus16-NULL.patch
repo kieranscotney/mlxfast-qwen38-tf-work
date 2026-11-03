@@ -1,0 +1,46 @@
+diff --git a/Vendor/TensorFold/zig/src/core/lane_projection.zig b/Vendor/TensorFold/zig/src/core/lane_projection.zig
+index ceb6ffe..e37cca7 100644
+--- a/Vendor/TensorFold/zig/src/core/lane_projection.zig
++++ b/Vendor/TensorFold/zig/src/core/lane_projection.zig
+@@ -125,6 +125,8 @@ pub const Layout = struct {
+     }
+ 
+     pub fn threadgroupBytes(l: Layout) usize {
++        // the plain reg kernel keeps its operands in registers: only the K splits' partial sums use threadgroup memory
++        if (l.reg and !l.swiglu and true) return @max(l.sk -| 1, 1) * l.prompt_tn * 16 * 32 * @sizeOf(f32);
+         return l.sk * 32 * l.format.group + @max(l.sk -| 1, 1) * l.prompt_tn * 16 * 32 * @sizeOf(f32);
+     }
+ 
+diff --git a/Vendor/TensorFold/zig/src/families/qwen27/dflash/runtime_backend.zig b/Vendor/TensorFold/zig/src/families/qwen27/dflash/runtime_backend.zig
+index fffe9b3..c5827c3 100644
+--- a/Vendor/TensorFold/zig/src/families/qwen27/dflash/runtime_backend.zig
++++ b/Vendor/TensorFold/zig/src/families/qwen27/dflash/runtime_backend.zig
+@@ -229,7 +229,7 @@ pub const Backend = struct {
+             try st.put(b.allocator, owned, .{ .prepared = dup, .key = key });
+         };
+         if (order) |o| {
+-            const adapter = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, prepared_words, try @import("../projection.zig").split(shape[0], shape[1]), o);
++            const adapter = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, prepared_words, try draftSplit(shape[0], shape[1]), o);
+             try @import("../residency.zig").putPrepared(b, key, adapter);
+         } else {
+             const t = try Tiled.init(b.target.device, prepared_words);
+@@ -273,7 +273,7 @@ pub const Backend = struct {
+         }
+         const key = (st.get(try std.fmt.bufPrint(&buf, "{d}{c}", .{ layer, key_part })).?).key + kind;
+         const joined = core.affine4.Prepared{ .allocator = b.allocator, .n = n, .k = k, .words = words, .scales = scales, .biases = biases };
+-        const adapter = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, joined, try @import("../projection.zig").split(n, k), order);
++        const adapter = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, joined, try draftSplit(n, k), order);
+         try @import("../residency.zig").putPrepared(b, key, adapter);
+         b.fused_count += 1;
+     }
+@@ -337,3 +337,10 @@ pub const Backend = struct {
+         try b.target.glue.unstack(e, .{ .buffer = x.buf, .offset = x.off }, .{ .buffer = y.buf, .offset = y.off }, .{ .rows = rows, .width = width, .stride = stride, .offset = 0 });
+     }
+ };
++
++/// The drafter's K splits: projection.split, except the tap fusion (K = five hidden widths), whose 160 column tiles
++/// leave the GPU short of threadgroups for a decoded round's few rows; sixteen splits double them.
++fn draftSplit(n: usize, k: usize) !u32 {
++    if (k >= 4 * n and n % 32 == 0 and k % (64 * 16) == 0) return 16;
++    return @import("../projection.zig").split(n, k);
++}

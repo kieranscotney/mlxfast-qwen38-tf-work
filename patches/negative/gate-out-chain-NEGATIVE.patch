@@ -1,0 +1,162 @@
+diff --git a/Vendor/TensorFold/zig/kernels/metal/core/deltanet.metal b/Vendor/TensorFold/zig/kernels/metal/core/deltanet.metal
+index d8a8cf1..6d9351e 100644
+--- a/Vendor/TensorFold/zig/kernels/metal/core/deltanet.metal
++++ b/Vendor/TensorFold/zig/kernels/metal/core/deltanet.metal
+@@ -814,6 +814,8 @@ kernel void tf_delta_gdn_post_rows(device const bfloat* recurrence [[buffer(0)]]
+                          constant uint& sums_stride [[buffer(6)]],
+                          device atomic_uint* NC [[buffer(7)]],
+                          constant uint& wait_for [[buffer(8)]],
++                         device atomic_uint* OC [[buffer(9)]],
++                         constant uint& count_out [[buffer(10)]],
+                          uint3 group [[threadgroup_position_in_grid]],
+                          uint3 groups [[threadgroups_per_grid]],
+                          uint t [[thread_index_in_threadgroup]],
+@@ -836,7 +838,7 @@ kernel void tf_delta_gdn_post_rows(device const bfloat* recurrence [[buffer(0)]]
+     threadgroup_barrier(mem_flags::mem_threadgroup);
+   }
+   const uint row = group.z * sgs + sg, head = group.y; // a row a simdgroup
+-  if (row >= p.rows || p.dv != 128) return;
++  if (row < p.rows && p.dv == 128) {
+   const uint at = (row * p.nv + head) * p.dv + lane * 4, z_at = p.zba_stride ? row * p.zba_stride + head * p.dv + lane * 4 : at;
+   const bfloat4 x = *(device const bfloat4*)(recurrence + at), z4 = *(device const bfloat4*)(gate + z_at);
+   float values[4];
+@@ -863,6 +865,16 @@ kernel void tf_delta_gdn_post_rows(device const bfloat* recurrence [[buffer(0)]]
+       sums[g * int(sums_stride) + int(row)] = acc;
+     }
+   }
++  }
++  // count_out: the out projection that reads `output` and `sums` shares this gate's barrier interval; each group counts
++  // itself on OC[0] once its stores are past a device-scope fence (the projection's wait_for)
++  if (count_out != 0u) {
++    threadgroup_barrier(mem_flags::mem_device);
++    if (t == 0) {
++      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
++      atomic_fetch_add_explicit(&OC[0], 1u, memory_order_relaxed);
++    }
++  }
+ }
+ 
+ // tf_delta_gdn_post_rows for a prompt chain's rows: 16 rows of a head a group of 128, 4 a simdgroup, each row's words
+diff --git a/Vendor/TensorFold/zig/src/families/qwen27/forward.zig b/Vendor/TensorFold/zig/src/families/qwen27/forward.zig
+index 07cda9a..3f7e81d 100644
+--- a/Vendor/TensorFold/zig/src/families/qwen27/forward.zig
++++ b/Vendor/TensorFold/zig/src/families/qwen27/forward.zig
+@@ -1,4 +1,5 @@
+ //! The layer program preserves Python's pending residual and only exposes post-block native tap rows.
++const gdn_mod = @import("gdn.zig");
+ const std = @import("std");
+ const mtl = @import("metal");
+ const Model = @import("model.zig").Model;
+@@ -131,7 +132,19 @@ pub const Stages = struct {
+         const dims = f.get(if (s.compact) .last_dims else .dims);
+         // the mixer's group sums of mixer_out (its rows, uncompacted) spare the projection its own sums pass; prompt rows'
+         // two-tile launch stores hidden + its output as the residual stream's next rows, which the norm then reads alone
+-        if (!s.compact and try m.kernels.quantResid(e, out, mixer_out, if (gated) sums(f, .sums, s.rows) else null, s.hidden, s.residual, s.rows)) {
++        // a counted GDN gate left its barrier interval open: the out projection waits on its groups, or closes it first
++        const gate_wait = gdn_mod.out_wait;
++        gdn_mod.out_wait = 0;
++        var chained = false;
++        if (gate_wait != 0) {
++            if (gated and !s.compact and m.kernels.countedWaits(out, s.rows)) {
++                const words = gdn_mod.out_counter.?;
++                const counted = try m.kernels.quantCountedOn(e, out, mixer_out, sums(f, .sums, s.rows), f.get(.output), s.rows, gate_wait, .{ .buf = words, .off = gdn_mod.out_words });
++                try m.kernels.normAfter(e, s.hidden, f.get(.output), wts.ref(layer.post_norm), f.get(.eps), dims, s.residual, f.get(.input), f.get(.sums), h, s.rows, counted);
++                chained = true;
++            } else e.barrier();
++        }
++        if (chained) {} else if (!s.compact and try m.kernels.quantResid(e, out, mixer_out, if (gated) sums(f, .sums, s.rows) else null, s.hidden, s.residual, s.rows)) {
+             e.barrier();
+             try m.kernels.norm(e, s.residual, null, wts.ref(layer.post_norm), f.get(.eps), dims, s.residual, f.get(.input), f.get(.sums), h, s.rows);
+         } else if (if (gated and !s.compact) try m.kernels.quantCounted(e, out, mixer_out, sums(f, .sums, s.rows), f.get(.output), s.rows) else null) |counted| {
+diff --git a/Vendor/TensorFold/zig/src/families/qwen27/gdn.zig b/Vendor/TensorFold/zig/src/families/qwen27/gdn.zig
+index 8837ee2..5744bfe 100644
+--- a/Vendor/TensorFold/zig/src/families/qwen27/gdn.zig
++++ b/Vendor/TensorFold/zig/src/families/qwen27/gdn.zig
+@@ -104,6 +104,12 @@ pub const Sums = struct { span: Span, stride: u32, written: *bool };
+ pub const Beside = struct { ptr: *anyopaque, encode: *const fn (*anyopaque, metal.ComputeEncoder) anyerror!void };
+ /// Byte offset of the prepare-to-star words (count, arrivals) in the pool's scan words, past the scan-to-gate pair.
+ pub const star_words: usize = 8;
++/// Byte offset of the gate-to-out words (count, arrivals) in the pool's scan words: a counted gate leaves no barrier and
++/// the GDN layer's out projection waits on `out_wait` gate groups there (forward.zig).
++pub const out_words: usize = 16;
++/// Set by a counted gate that left its barrier interval open, taken (and zeroed) by the out projection that closes it.
++pub var out_wait: u32 = 0;
++pub var out_counter: ?metal.Buffer = null;
+ /// A deferred replay's rows for a star scan (tf_delta_gdn_star_pending): the layer's pending key, value, decay and mixing
+ /// rows, and how many it applies and whether it writes the state back.
+ pub const Pending = struct { key: Span, value: Span, decay: Span, mixing: Span, use: abi.Deferred };
+@@ -309,10 +315,18 @@ pub const Round = struct {
+         }
+         e.setBuffer(counter, 0, 7);
+         e.setValue(wait, 8);
++        const open = out_chain and r.sums != null;
++        e.setBuffer(counter, out_words, 9);
++        e.setValue(@as(u32, @intFromBool(open)), 10);
+         // eight rows a group: half the groups waiting on the star's count (one poller a group), as the star's own wait
+         e.dispatchGroups(.{ .width = 1, .height = r.p.nv, .depth = (r.p.rows + 7) / 8 }, .{ .width = 256 });
+-        e.barrier();
++        if (open) {
++            out_wait = r.p.nv * ((r.p.rows + 7) / 8);
++            out_counter = counter;
++        } else e.barrier();
+     }
++    /// Whether a counted gate leaves its barrier interval open for the out projection to wait on its groups.
++    pub const out_chain = true;
+     pub fn gate(r: Round, e: metal.ComputeEncoder, rows: metal.Pipeline) void {
+         const wide = r.gateRows();
+         e.setPipeline(if (wide) rows else r.pipelines.post);
+@@ -330,6 +344,8 @@ pub const Round = struct {
+         if (wide) {
+             r.b.output.bind(e, 7); // never read: wait_for 0
+             e.setValue(@as(u32, 0), 8);
++            r.b.output.bind(e, 9); // never written: count_out 0
++            e.setValue(@as(u32, 0), 10);
+         }
+         e.dispatchGroups(.{ .width = 1, .height = r.p.nv, .depth = if (wide) (r.p.rows + 3) / 4 else r.p.rows }, .{ .width = if (wide) 128 else 32 });
+         e.barrier();
+diff --git a/Vendor/TensorFold/zig/src/families/qwen27/gdn_pool_gpu.zig b/Vendor/TensorFold/zig/src/families/qwen27/gdn_pool_gpu.zig
+index f981866..43789ca 100644
+--- a/Vendor/TensorFold/zig/src/families/qwen27/gdn_pool_gpu.zig
++++ b/Vendor/TensorFold/zig/src/families/qwen27/gdn_pool_gpu.zig
+@@ -113,8 +113,8 @@ pub const Pool = struct {
+         const kernels = try Kernels.init(device);
+         // words 0-1: the star scan's count and its gate's arrivals; words 2-3 (gdn.star_words): the prepare's count and the
+         // star scan's arrivals
+-        const scan_words = try device.buffer(16, metal.ResourceOptions.shared | metal.ResourceOptions.untracked);
+-        @memset(scan_words.contents()[0..16], 0);
++        const scan_words = try device.buffer(24, metal.ResourceOptions.shared | metal.ResourceOptions.untracked);
++        @memset(scan_words.contents()[0..24], 0);
+         return .{ .budget = budget, .buffers = buffers, .kernels = kernels, .scan_words = scan_words };
+     }
+ 
+diff --git a/Vendor/TensorFold/zig/src/families/qwen27/quant_gpu.zig b/Vendor/TensorFold/zig/src/families/qwen27/quant_gpu.zig
+index 56505e3..d3267f3 100644
+--- a/Vendor/TensorFold/zig/src/families/qwen27/quant_gpu.zig
++++ b/Vendor/TensorFold/zig/src/families/qwen27/quant_gpu.zig
+@@ -658,8 +658,16 @@ pub const Kernels = struct {
+     /// quantCounted for a projection whose input rows and sums come from a gateUpCounted launch in the same barrier interval:
+     /// its threadgroups wait on that launch's `wait_for` threadgroups before they read them.
+     pub fn quantCountedAfter(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: Sums, y: Ref, rows: u32, wait_for: u32) !u32 {
+-        const key = k.countedKey(p, rows, true) orelse return error.BadCoreProjectionRows;
+         const gu = k.gu_words orelse return error.BadCoreProjectionRows;
++        return k.quantCountedOn(input_encoder, p, x, xs, y, rows, wait_for, .{ .buf = gu });
++    }
++    /// Whether `p` over `rows` decoded rows takes quantCountedOn (a parallel split-K counted launch that waits).
++    pub fn countedWaits(k: *Kernels, p: projection.Linear, rows: u32) bool {
++        return k.countedKey(p, rows, true) != null;
++    }
++    /// quantCountedAfter waiting on `words` (count, arrivals) of a producer in the same barrier interval.
++    pub fn quantCountedOn(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: Sums, y: Ref, rows: u32, wait_for: u32, words: lane.Ref) !u32 {
++        const key = k.countedKey(p, rows, true) orelse return error.BadCoreProjectionRows;
+         if (k.count_words == null) {
+             const b = try k.device.buffer(8, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+             @memset(b.contents()[0..8], 0);
+@@ -675,7 +683,7 @@ pub const Kernels = struct {
+             k.joined(entry.value_ptr);
+         }
+         const w = lane.Ref{ .buf = p.words.buffer, .off = p.words.offset };
+-        try entry.value_ptr.encodeCountedAfter(span.encoder, .{ .buf = x.buffer, .off = x.offset }, w, metadata(p, key.sbi), .{ .ref = .{ .buf = xs.ref.buffer, .off = xs.ref.offset }, .stride = xs.stride }, .{ .buf = y.buffer, .off = y.offset }, rows, .{ .buf = k.count_words.? }, .{ .buf = gu }, wait_for);
++        try entry.value_ptr.encodeCountedAfter(span.encoder, .{ .buf = x.buffer, .off = x.offset }, w, metadata(p, key.sbi), .{ .ref = .{ .buf = xs.ref.buffer, .off = xs.ref.offset }, .stride = xs.stride }, .{ .buf = y.buffer, .off = y.offset }, rows, .{ .buf = k.count_words.? }, words, wait_for);
+         try span.end();
+         return @intCast(entry.value_ptr.tile_count);
+     }

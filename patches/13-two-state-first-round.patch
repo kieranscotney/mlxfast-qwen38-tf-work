@@ -1,0 +1,556 @@
+From: Kieran Scotney
+Subject: Staged first-round catch-up: prompt taps but the last 128 absorbed on the staging queue, the first block drafted from the cold rows
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+From: Kieran Scotney
+Subject: WIP: drafter append staged on its own queue behind the verify's last tap layer (with diagnostics)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+---
+diff --git a/zig/src/core/segments.zig b/zig/src/core/segments.zig
+index dc9541b..20355b1 100644
+--- a/zig/src/core/segments.zig
++++ b/zig/src/core/segments.zig
+@@ -80,6 +80,10 @@ pub fn runCommittingFrom(device: mtl.Device, queues: []const mtl.Queue, layers:
+ /// `runCommittingFrom`; `early` (one lane) also commits after the first layer's mixer and after each of the first three
+ /// layers, so a long pass's GPU starts on the first mixer while the CPU encodes the rest of that layer and never waits
+ /// for the first `every` layers' encode.
++/// A one-lane pass's event signalled between encoders right after one layer's MLP (a DFlash staging frame on another
++/// queue waits for its last tap layer); `signalled` reports that the pass encoded it.
++pub var after_layer: ?struct { ev: mtl.Event, value: u64, layer: usize } = null;
++pub var after_layer_signalled: bool = false;
+ pub fn runCommittingEarly(device: mtl.Device, queues: []const mtl.Queue, layers: usize, mode: mtl.DispatchType, fam: anytype, first: usize, every: usize, early: bool) !f64 {
+     try checkUnchecked();
+     const n = queues.len;
+@@ -166,6 +170,10 @@ pub fn runCommittingEarly(device: mtl.Device, queues: []const mtl.Queue, layers:
+         }
+         pub fn post(x: *const @This(), k: usize, i: usize) !void {
+             try x.fam.post(&x.lanes[k], i);
++            if (after_layer) |s| if (x.lanes.len == 1 and i == s.layer) {
++                x.sync(&x.lanes[k], s.ev, s.value, false);
++                after_layer_signalled = true;
++            };
+             if (x.every == 0 or i + 1 >= x.layers) return;
+             // `first` 0 commits after the first layer's mixer and again after its MLP, so the GPU runs that MLP while the
+             // host encodes the next chunk's layers
+diff --git a/zig/src/families/qwen27/dflash/execution.zig b/zig/src/families/qwen27/dflash/execution.zig
+index 7a5a9cc..6010cf0 100644
+--- a/zig/src/families/qwen27/dflash/execution.zig
++++ b/zig/src/families/qwen27/dflash/execution.zig
+@@ -68,13 +68,24 @@ fn encodeAppend(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, tap
+     return encodeAppendTo(ops, g, preparation, taps, positions, frame, .{ .transaction = transaction });
+ }
+ fn encodeAppendTo(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, taps: op.View, positions: []const u64, frame: u64, sink: Sink) !void {
++    // an early frame whose rows' keys and values a staging frame already computed gathers the admitted ones instead
++    if (sink == .transaction) if (ops.vtable.append_held) |held| if (try held(ops.ptr, sink.transaction, frame, positions)) return;
++    if (g.layers.len > max_layers) return error.DraftOperatorShape;
++    var keys: [max_layers]op.View = undefined;
++    var values: [max_layers]op.View = undefined;
++    try appendValues(ops, g, preparation, taps, positions, frame, &keys, &values);
++    for (g.layers, 0..) |_, i| switch (sink) {
++        .transaction => |t| try ops.vtable.context_append(ops.ptr, t, frame, @intCast(i), keys[i], values[i], positions),
++        .stream => |k| try ops.vtable.stream_append(ops.ptr, frame, k, @intCast(i), keys[i], values[i], positions),
++    };
++}
++/// The keys and values an append writes for `taps` rows at `positions`, layer by layer, without writing them.
++pub fn appendValues(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, taps: op.View, positions: []const u64, frame: u64, keys: *[max_layers]op.View, values: *[max_layers]op.View) !void {
+     const c = g.config;
+     const fusion = try project(ops, frame, taps, g.fusion, preparation.mode);
+     const hidden = try norm(ops, frame, fusion, g.hidden_norm, c.eps, 1, c.hidden);
+     // stage by stage across the layers (every product, then every norm, rope and append), so a frame's concurrent
+     // encoder runs each stage's independent layers side by side; each value is computed exactly as layer by layer
+-    var keys: [max_layers]op.View = undefined;
+-    var values: [max_layers]op.View = undefined;
+     if (g.layers.len > max_layers) return error.DraftOperatorShape;
+     for (g.layers, 0..) |layer, i| {
+         if (try group(ops, frame, hidden, layer.attention.k, 1, preparation.mode)) |kv| {
+@@ -87,13 +98,9 @@ fn encodeAppendTo(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, t
+     }
+     for (g.layers, 0..) |layer, i| keys[i] = try norm(ops, frame, keys[i], layer.attention.k_norm, c.eps, c.kv_heads, c.head_dim);
+     for (g.layers, 0..) |_, i| keys[i] = try rotate(ops, frame, keys[i], positions, c.kv_heads, c);
+-    for (g.layers, 0..) |_, i| switch (sink) {
+-        .transaction => |t| try ops.vtable.context_append(ops.ptr, t, frame, @intCast(i), keys[i], values[i], positions),
+-        .stream => |k| try ops.vtable.stream_append(ops.ptr, frame, k, @intCast(i), keys[i], values[i], positions),
+-    };
+ }
+ /// Layers a stage-by-stage append holds at once.
+-const max_layers = 16;
++pub const max_layers = 16;
+ 
+ /// append then forwardBlock in one frame: one commit and one wait for the committed taps and the block that reads them.
+ pub fn appendBlock(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, context: op.Context, taps: op.View, positions: []const u64, next: op.Context, anchor: u32, block: u32) !op.Lattice {
+diff --git a/zig/src/families/qwen27/dflash/generation.zig b/zig/src/families/qwen27/dflash/generation.zig
+index ee98f24..d794047 100644
+--- a/zig/src/families/qwen27/dflash/generation.zig
++++ b/zig/src/families/qwen27/dflash/generation.zig
+@@ -16,6 +16,7 @@ pub const Result = struct { tokens: []u32, rounds: usize, verified: usize, match
+ pub const Extender = struct { ptr: *anyopaque, call: *const fn (*anyopaque, []const u32, u32) anyerror![]const u32 };
+ /// The weight of a round in Generation.accept_share, and the share below which frames draft on q4 copies.
+ const accept_step: f32 = 0.125;
++var acct: struct { rounds: usize = 0, landed: usize = 0, precise: usize = 0, rows: usize = 0, wall: f64 = 0, last: f64 = 0 } = .{};
+ const precise_below: f32 = 0.95;
+ /// The target's first layer's input projections, whole (quant_gpu.Kernels.warmAll): the first weights a verify streams.
+ fn warmFirstLayer(ptr: *anyopaque, e: mtl.ComputeEncoder) anyerror!void {
+@@ -255,6 +256,14 @@ pub const Generation = struct {
+             // the next round's frame goes first, on the picks' fence (its words picked on the GPU from this round's
+             // result); the keep follows once the verify ran, so it runs beside the frame (Frame.early)
+             if (p.early) {
++                // every verify row's drafter keys and values, staged on their own queue beside the verify's last layers
++                const rows: u32 = if (p.shape) |shape| shape.rows else 0;
++                _ = g.draft.stageNext(g.runner.model.glue, &g.runner.taps, rows, &g.commit, result) catch |err| blk: {
++                    std.log.warn("STAGE error {s}", .{@errorName(err)});
++                    break :blk false;
++                };
++                defer g.draft.backend.frame.wait_before = null;
++                errdefer g.draft.backend.held = null;
+                 const prepared = g.draft.prepareNext(.{ .ptr = p, .encode = lead }, 2) catch |err| {
+                     keep_cb.commit();
+                     g.keep = keep_cb.retain();
+@@ -265,6 +274,7 @@ pub const Generation = struct {
+                     p.held = true;
+                     return;
+                 }
++                g.draft.backend.held = null;
+             }
+             // committed without a wait: the drafter must not read or write what the keep writes until finishKeep
+             keep_cb.commit();
+@@ -315,6 +325,8 @@ pub const Generation = struct {
+         // a frame the keep hook committed runs on: an error waits for it (and fails the drafter if it admitted nothing)
+         errdefer g.draft.drainNext() catch {};
+         errdefer picks.release();
++        if (early) g.draft.armStage() catch {};
++        defer @import("core").segments.after_layer = null;
+         try g.runner.verifyHead(round, .all);
+         picks.release();
+         errdefer g.runner.failed = true;
+@@ -425,6 +437,18 @@ pub const Generation = struct {
+         if (accepted.path.len == 0 or accepted.tokens.len == 0 or accepted.tokens.len > @min(@import("core").tree_round.max_rows, remaining)) return error.EmptyAcceptedDraft;
+         g.accept_share += (@as(f32, @floatFromInt(@intFromBool(accepted.matched > 0))) - g.accept_share) * accept_step;
+         g.draft.backend.precise = g.accept_share < precise_below;
++        acct.rounds += 1;
++        acct.landed += @intFromBool(accepted.matched > 0);
++        acct.precise += @intFromBool(g.draft.backend.precise);
++        acct.rows += ids.len;
++        {
++            var t: std.c.timespec = undefined;
++            _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &t);
++            const now = @as(f64, @floatFromInt(t.sec)) + @as(f64, @floatFromInt(t.nsec)) * 1e-9;
++            if (acct.last != 0 and now - acct.last < 0.2) acct.wall += now - acct.last;
++            acct.last = now;
++        }
++        if (acct.rounds % 128 == 0) std.log.warn("ACCT rounds={d} landed={d} precise={d} rows={d} round_ms={d:.3}", .{ acct.rounds, acct.landed, acct.precise, acct.rows, acct.wall * 1e3 / @as(f64, @floatFromInt(acct.rounds - 1)) });
+         var landed: u32 = 0;
+         for (accepted.path) |row| landed += @intFromBool(row >= drafted.len);
+         const tokens = try g.allocator.dupe(u32, accepted.tokens);
+diff --git a/zig/src/families/qwen27/dflash/operators.zig b/zig/src/families/qwen27/dflash/operators.zig
+index 10ca4c9..31cf9ff 100644
+--- a/zig/src/families/qwen27/dflash/operators.zig
++++ b/zig/src/families/qwen27/dflash/operators.zig
+@@ -85,6 +85,8 @@ pub const Ops = struct {
+         project_group: ?*const fn (*anyopaque, u64, View, ck.Tensor, u32, Mode) anyerror!?View = null,
+         // columns [first, first + width) of a view, an alias in the frame
+         slice_cols: ?*const fn (*anyopaque, u64, View, u32, u32) anyerror!View = null,
++        /// An early frame's append from rows a staging frame computed: true when it wrote them (transaction, epoch, positions).
++        append_held: ?*const fn (*anyopaque, u64, u64, []const u64) anyerror!bool = null,
+         // lattice in two calls: the head's top-k encoded and the frame committed without a wait (its picks), then, once
+         // the GPU ran it, the wait and the readback; null: lattice only
+         lattice_begin: ?*const fn (*anyopaque, u64, Head, Config) anyerror!View = null,
+diff --git a/zig/src/families/qwen27/dflash/runtime_backend.zig b/zig/src/families/qwen27/dflash/runtime_backend.zig
+index af5bad2..4df009d 100644
+--- a/zig/src/families/qwen27/dflash/runtime_backend.zig
++++ b/zig/src/families/qwen27/dflash/runtime_backend.zig
+@@ -173,6 +173,20 @@ pub const Lead = struct { ptr: *anyopaque, encode: *const fn (*anyopaque, mtl.Co
+ 
+ pub const HeldNorm = struct { x: op.View, p: op.Norm, y: op.View };
+ 
++/// Every verify row's context keys and values for the drafter's layers, computed by a staging frame while the verify's
++/// last layers ran (Model.stageNext), contiguous rows of kvWidth; the next early frame gathers the admitted rows.
++pub const Held = struct {
++    rows: u32,
++    keys: [16]Ref,
++    values: [16]Ref,
++    commit: *const core.tree_commit_gpu.Ops,
++    result: core.tree_commit_gpu.Ref,
++};
++
++/// A frame on its own queue for the staging, and the events that order it after the verify's last tap layer and before
++/// the early frame that gathers its rows.
++pub const Stage = struct { queue: mtl.Queue, frame: Frame, taps: mtl.SharedEvent, done: mtl.SharedEvent, value: u64 = 0 };
++
+ pub const Backend = struct {
+     allocator: std.mem.Allocator,
+     residency: ?mtl.ResidencySet.Follow = null,
+@@ -216,6 +230,15 @@ pub const Backend = struct {
+     /// While a frame is encoded early (its context and anchor are placeholders for the larger count): its first encoder
+     /// runs this, and the launches that depend on the admitted count read their words from block 0 of `args`.
+     early: ?Lead = null,
++    /// Rows a staging frame computed for the next early frame's append (context.appendHeld).
++    held: ?Held = null,
++    stage: ?Stage = null,
++    /// The next context commit only commits its frame (a staged catch-up on the staging queue); cleared once used.
++    commit_no_wait: bool = false,
++    /// The staging frame is swapped in as `frame` (Model.flushStaged).
++    in_stage: bool = false,
++    /// The next frame's command buffers wait for this event value first (a frame behind a staged catch-up).
++    wait_once: ?struct { ev: mtl.Event, value: u64 } = null,
+     pub fn init(a: std.mem.Allocator, target: *Target, checkpoint: *core.checkpoint_metal.Checkpoint, c: cfg.Config) !Backend {
+         try c.check();
+         const primitives = try core.draft_ops.Ops.init(target.device);
+@@ -251,6 +274,12 @@ pub const Backend = struct {
+     pub fn deinit(b: *Backend) void {
+         b.setResident(null);
+         b.frame.deinit();
++        if (b.stage) |*s| {
++            s.frame.deinit();
++            s.taps.deinit();
++            s.done.deinit();
++            s.queue.deinit();
++        }
+         var prepared = b.prepared.valueIterator();
+         while (prepared.next()) |adapter| adapter.deinit();
+         b.prepared.deinit(b.allocator);
+@@ -479,7 +508,7 @@ pub const Backend = struct {
+         return b.frame.encoder;
+     }
+     /// Encodes the held conv (and with `norms` the held norms) on their own.
+-    fn flushHeld(b: *Backend, norms: bool) !void {
++    pub fn flushHeld(b: *Backend, norms: bool) !void {
+         if (b.held_conv) |h| {
+             b.held_conv = null;
+             try b.encodeConv(b.frame.encoder, h.x, h.p, h.y);
+diff --git a/zig/src/families/qwen27/dflash/runtime_callbacks.zig b/zig/src/families/qwen27/dflash/runtime_callbacks.zig
+index e187875..edc9530 100644
+--- a/zig/src/families/qwen27/dflash/runtime_callbacks.zig
++++ b/zig/src/families/qwen27/dflash/runtime_callbacks.zig
+@@ -18,6 +18,11 @@ fn begin(ptr: *anyopaque) !u64 {
+     b.held_conv = null;
+     b.held_norms = @splat(null);
+     b.hazards.clear();
++    if (b.wait_once) |w| b.frame.wait_before = .{ .ev = w.ev, .value = w.value };
++    defer if (b.wait_once != null) {
++        b.wait_once = null;
++        b.frame.wait_before = null;
++    };
+     const lead = b.early orelse return b.frame.begin();
+     // an early frame: its words are picked from the verify's result before anything reads them
+     const epoch = try b.frame.beginEarly(true);
+@@ -33,6 +38,8 @@ fn release(ptr: *anyopaque, epoch: u64) void {
+     const b = backend(ptr);
+     if (epoch != b.frame.epoch) return;
+     // a frame abandoned before finish (an error path) now runs, and its context appends may overwrite ring rows
++    // a staged catch-up's frame runs on: its owner (Model.flushStaged) completes it by its done event
++    if (b.in_stage and b.frame.active and b.frame.committed and !b.frame.completed) return;
+     if (b.frame.active and !b.frame.completed) b.failed = true;
+     b.frame.release();
+ }
+@@ -406,4 +413,4 @@ fn lattices(ptr: *anyopaque, epoch: u64, h: op.Head, projected: op.View, c: Conf
+ }
+ pub const offer_sums = offerSums;
+ pub const sums_rows = sums_stride;
+-pub const vtable = op.Ops.VTable{ .begin = begin, .release = release, .project = project, .norm = norm, .embed = embed, .conv = conv, .rope = rope, .attention = context.attention, .swiglu = swiglu, .mask_rows = maskRows, .head = head, .lattice = lattice, .lattices = lattices, .context_begin = context.begin, .context_append = context.append, .context_commit = context.commit, .context_stage = context.stage, .context_abort = context.abort, .stream_append = context.streamAppend, .project_group = projectGroup, .slice_cols = sliceCols, .lattice_begin = latticeBegin, .lattice_end = latticeEnd };
++pub const vtable = op.Ops.VTable{ .begin = begin, .release = release, .project = project, .norm = norm, .embed = embed, .conv = conv, .rope = rope, .attention = context.attention, .swiglu = swiglu, .mask_rows = maskRows, .head = head, .lattice = lattice, .lattices = lattices, .context_begin = context.begin, .context_append = context.append, .append_held = context.appendHeld, .context_commit = context.commit, .context_stage = context.stage, .context_abort = context.abort, .stream_append = context.streamAppend, .project_group = projectGroup, .slice_cols = sliceCols, .lattice_begin = latticeBegin, .lattice_end = latticeEnd };
+diff --git a/zig/src/families/qwen27/dflash/runtime_context.zig b/zig/src/families/qwen27/dflash/runtime_context.zig
+index e2db488..9e5395c 100644
+--- a/zig/src/families/qwen27/dflash/runtime_context.zig
++++ b/zig/src/families/qwen27/dflash/runtime_context.zig
+@@ -29,6 +29,39 @@ pub fn append(ptr: *anyopaque, transaction: u64, epoch: u64, layer: u32, keys: o
+     b.appended |= @as(u32, 1) << @intCast(layer);
+     b.appended_rows = @intCast(positions.len);
+ }
++/// An early frame's append from a staging frame's rows (Backend.held): the rows the verify admits, gathered from every
++/// verify row's keys and values by the round's result, then written as `append` writes them. False when none are held.
++pub fn appendHeld(ptr: *anyopaque, transaction: u64, epoch: u64, positions: []const u64) !bool {
++    const b = cast(ptr);
++    const h = b.held orelse return false;
++    b.held = null;
++    if (!b.admitting()) return false;
++    const e = try b.encoder(epoch);
++    if (b.transaction != transaction or transaction != epoch or b.appended != 0 or positions.len != 2) return error.BadDraftContext;
++    for (positions, 0..) |position, i| if (position != b.context.end + i) return error.BadCommittedTaps;
++    const width = b.config.kvWidth();
++    var keys: [16]op.View = undefined;
++    var values: [16]op.View = undefined;
++    const layers = b.config.layers;
++    if (layers > keys.len) return error.BadDraftContext;
++    const shape = @import("core").tree_commit_gpu.Taps{ .rows = h.rows, .width = width, .capacity = h.rows, .planes = 1 };
++    for (0..layers) |i| {
++        keys[i] = try b.frame.alloc(2, width, .bf16);
++        values[i] = try b.frame.alloc(2, width, .bf16);
++        b.access(e, &.{}, &.{ try b.span(keys[i]), try b.span(values[i]) });
++        const k = try b.frame.ref(keys[i]);
++        const v = try b.frame.ref(values[i]);
++        try h.commit.tapsInto(e, h.result, .{ .buf = h.keys[i].buf, .off = h.keys[i].off }, .{ .buf = k.buf, .off = k.off }, shape, 2);
++        try h.commit.tapsInto(e, h.result, .{ .buf = h.values[i].buf, .off = h.values[i].off }, .{ .buf = v.buf, .off = v.off }, shape, 2);
++    }
++    for (0..layers) |i| try appendRows(b, e, b.caches[i], keys[i], values[i], positions);
++    b.appended = (@as(u32, 1) << @intCast(layers)) - 1;
++    b.appended_rows = 2;
++    held_used += 1;
++    if (held_used % 128 == 0) std.log.warn("HELD used={d}", .{held_used});
++    return true;
++}
++pub var held_used: usize = 0;
+ pub fn streamAppend(ptr: *anyopaque, epoch: u64, stream: u32, layer: u32, keys: op.View, values: op.View, positions: []const u64) !void {
+     const b = cast(ptr);
+     const e = try b.encoder(epoch);
+@@ -72,7 +105,13 @@ fn ready(b: *Backend, transaction: u64, epoch: u64, next: op.Context) !void {
+ pub fn commit(ptr: *anyopaque, transaction: u64, epoch: u64, next: op.Context) !void {
+     const b = cast(ptr);
+     try ready(b, transaction, epoch, next);
+-    b.frame.finish() catch |err| {
++    if (b.commit_no_wait) {
++        b.commit_no_wait = false;
++        b.frame.commitLast(false) catch |err| {
++            b.failed = true;
++            return err;
++        };
++    } else b.frame.finish() catch |err| {
+         b.failed = true;
+         return err;
+     };
+diff --git a/zig/src/families/qwen27/dflash/runtime_frame.zig b/zig/src/families/qwen27/dflash/runtime_frame.zig
+index fa1a38c..e207b0d 100644
+--- a/zig/src/families/qwen27/dflash/runtime_frame.zig
++++ b/zig/src/families/qwen27/dflash/runtime_frame.zig
+@@ -127,6 +127,11 @@ pub const Frame = struct {
+     poll_value: u64 = 0,
+     unchecked: [9]mtl.CommandBuffer = undefined,
+     n_unchecked: usize = 0,
++    /// Waited for before the frame's command buffers run (a staging frame: the verify's last tap layer; an early frame
++    /// that gathers staged rows: the staging frame's end).
++    wait_before: ?struct { ev: mtl.Event, value: u64 } = null,
++    /// Signalled behind the frame's last command (a staging frame, for the early frame that gathers its rows).
++    signal_after: ?struct { ev: mtl.Event, value: u64 } = null,
+     pub fn setResident(f: *Frame, hook: ?mtl.ResidencySet.Follow) void {
+         for (f.pool.items) |buffer| {
+             if (f.residency) |h| h.leave(h.ctx, buffer);
+@@ -198,6 +203,7 @@ pub const Frame = struct {
+     }
+     fn open(f: *Frame) mtl.CommandBuffer {
+         const cb = f.queue.commandBuffer();
++        if (f.wait_before) |w| cb.waitForEvent(w.ev, w.value);
+         return if (f.early) cb.retain() else cb;
+     }
+     /// Ends an early frame's hold on its command buffers.
+@@ -247,6 +253,7 @@ pub const Frame = struct {
+             f.poll_value += 1;
+             f.cb.signal(ev, f.poll_value);
+         }
++        if (f.signal_after) |s| f.cb.signalEvent(s.ev, s.value);
+         f.cb.commit();
+         f.committed = true;
+         f.bridge_due = bridged;
+diff --git a/zig/src/families/qwen27/dflash/runtime_model.zig b/zig/src/families/qwen27/dflash/runtime_model.zig
+index 008b55a..1a94723 100644
+--- a/zig/src/families/qwen27/dflash/runtime_model.zig
++++ b/zig/src/families/qwen27/dflash/runtime_model.zig
+@@ -23,8 +23,15 @@ const Early = struct {
+     /// Taps the verify admitted, once the host read it (commitNext).
+     rows: ?u32 = null,
+ };
++var dbg_n: usize = 0;
++/// The per-round append overlap (armStage/stageNext): measured neutral, off.
++const overlap_rounds = false;
++/// Prompt rows a staged catch-up leaves to the first frame (flushStaged): the first round drafts from these alone.
++const cold_rows = 128;
+ pub const Model = struct {
+     allocator: std.mem.Allocator,
++    /// Where a staged catch-up's first block attends from (flushStaged), until that block is drafted.
++    cold_begin: ?u64 = null,
+     checkpoint: core.checkpoint_metal.Checkpoint,
+     backend: Backend,
+     graph: weights.Graph,
+@@ -150,6 +157,164 @@ pub const Model = struct {
+         m.early = .{ .block = prepared, .context = context };
+         return true;
+     }
++    /// Arms the verify about to be encoded to signal the staging frame's event right after the drafter's last tap layer
++    /// (core.segments.after_layer); stageNext then commits that frame behind it.
++    pub fn armStage(m: *Model) !void {
++        const segments = core.segments;
++        segments.after_layer = null;
++        segments.after_layer_signalled = false;
++        if (!overlap_rounds) return;
++        if (!m.canPrepare(2)) return;
++        const b = &m.backend;
++        if (b.stage == null) {
++            const device = b.frame.device;
++            const queue = try device.queue();
++            errdefer queue.deinit();
++            const taps = try device.sharedEvent();
++            errdefer taps.deinit();
++            const done = try device.sharedEvent();
++            b.stage = .{ .queue = queue, .frame = .{ .allocator = b.allocator, .device = device, .queue = queue }, .taps = taps, .done = done };
++            b.stage.?.frame.setResident(b.frame.residency);
++        }
++        const s = &b.stage.?;
++        s.value += 1;
++        var last: u32 = 0;
++        for (m.graph.config.taps) |tap| last = @max(last, tap);
++        segments.after_layer = .{ .ev = .{ .id = s.taps.id }, .value = s.value, .layer = last };
++        dbg_n += 1;
++        if (dbg_n < 4) std.log.warn("STAGE arm value={d} layer={d}", .{ s.value, last });
++    }
++    /// On its own queue, behind the armed verify's last tap layer: every verify row's context keys and values for the
++    /// drafter (the append's arithmetic, row 0 at the context's end and the rest one past it) while the verify's last
++    /// layers run. The next early frame waits for it and gathers the rows the round's result admits (context.appendHeld).
++    pub fn stageNext(m: *Model, glue: @import("../glue_gpu.zig").Kernels, taps: *const @import("../taps.zig").Taps, rows: u32, commit: *const core.tree_commit_gpu.Ops, result: core.tree_commit_gpu.Ref) !bool {
++        const segments = core.segments;
++        const signalled = segments.after_layer_signalled and segments.after_layer != null;
++        segments.after_layer = null;
++        segments.after_layer_signalled = false;
++        const b = &m.backend;
++        b.held = null;
++        if (dbg_n < 4) std.log.warn("STAGE next signalled={} rows={d} can={}", .{ signalled, rows, m.canPrepare(2) });
++        if (!signalled or rows < 2 or rows > 16 or rows > taps.capacity or !m.canPrepare(2)) return false;
++        const s = &(b.stage orelse return false);
++        const c = m.graph.config;
++        if (c.layers > execution.max_layers or c.layers > 16) return false;
++        if (s.frame.active) {
++            // its command buffers are not retained past the round that committed it: its done event says it ran
++            if (s.frame.signal_after) |done| while (s.done.value() < done.value) std.atomic.spinLoopHint();
++            s.frame.completed = true;
++            s.frame.release();
++        }
++        s.frame.wait_before = .{ .ev = .{ .id = s.taps.id }, .value = s.value };
++        s.frame.signal_after = .{ .ev = .{ .id = s.done.id }, .value = s.value };
++        std.mem.swap(backend_mod.Frame, &b.frame, &s.frame);
++        var swapped = true;
++        defer if (swapped) std.mem.swap(backend_mod.Frame, &b.frame, &s.frame);
++        const ops = b.ops();
++        const epoch = try ops.vtable.begin(ops.ptr);
++        if (dbg_n < 4) std.log.warn("STAGE begun", .{});
++        errdefer b.frame.release();
++        const e = try b.encoder(epoch);
++        const x = try b.frame.alloc(rows, c.tapWidth(), .bf16);
++        const ids = try b.frame.alloc(rows, 4, .u8);
++        const xr = try b.frame.ref(x);
++        const ir = try b.frame.ref(ids);
++        for (ir.buf.slice(u32, rows), 0..) |*id, i| id.* = @intCast(i);
++        b.access(e, &.{}, &.{try b.span(x)});
++        try glue.tapRows(e, .{ .buffer = taps.buffer }, .{ .buffer = ir.buf, .offset = ir.off }, .{ .buffer = xr.buf, .offset = xr.off }, .{ .rows = rows, .width = taps.width, .capacity = taps.capacity, .planes = 5 });
++        var positions: [16]u64 = undefined;
++        for (positions[0..rows], 0..) |*p, i| p.* = m.session.context.end + @intFromBool(i > 0);
++        var keys: [execution.max_layers]op.View = undefined;
++        var values: [execution.max_layers]op.View = undefined;
++        try execution.appendValues(ops, &m.graph, m.preparation, x, positions[0..rows], epoch, &keys, &values);
++        var held = backend_mod.Held{ .rows = rows, .keys = undefined, .values = undefined, .commit = commit, .result = result };
++        for (0..c.layers) |i| {
++            held.keys[i] = try contiguous(b, epoch, keys[i]);
++            held.values[i] = try contiguous(b, epoch, values[i]);
++        }
++        try b.flushHeld(true);
++        try b.frame.commitLast(false);
++        std.mem.swap(backend_mod.Frame, &b.frame, &s.frame);
++        swapped = false;
++        b.held = held;
++        // the early frame encoded next waits for the staging frame's end before its first command
++        b.frame.wait_before = .{ .ev = .{ .id = s.done.id }, .value = s.value };
++        if (dbg_n < 4) std.log.warn("STAGE committed", .{});
++        return true;
++    }
++    /// A staging view's rows as a ref of contiguous kvWidth rows (copied when the view is a column slice).
++    fn contiguous(b: *Backend, epoch: u64, v: op.View) !backend_mod.Ref {
++        if (v.stride == v.width) return b.frame.ref(v);
++        const e = try b.encoder(epoch);
++        const y = try b.frame.alloc(v.rows, v.width, .bf16);
++        b.access(e, &.{try b.span(v)}, &.{try b.span(y)});
++        try b.copy(e, try b.frame.ref(v), try b.frame.ref(y), v.rows, v.width, v.stride);
++        return b.frame.ref(y);
++    }
++    fn stageQueue(m: *Model) !*backend_mod.Stage {
++        const b = &m.backend;
++        if (b.stage == null) {
++            const device = b.frame.device;
++            const queue = try device.queue();
++            errdefer queue.deinit();
++            const taps = try device.sharedEvent();
++            errdefer taps.deinit();
++            const done = try device.sharedEvent();
++            b.stage = .{ .queue = queue, .frame = .{ .allocator = b.allocator, .device = device, .queue = queue }, .taps = taps, .done = done };
++            b.stage.?.frame.setResident(b.frame.residency);
++        }
++        const s = &b.stage.?;
++        if (s.frame.active) {
++            // its command buffers are not retained past the call that committed it: its done event says it ran
++            if (s.frame.signal_after) |done| while (s.done.value() < done.value) std.atomic.spinLoopHint();
++            s.frame.completed = true;
++            s.frame.release();
++        }
++        return s;
++    }
++    /// A prompt's catch-up split in two: every committed tap but the last cold_rows absorbed on the staging queue without a
++    /// wait (one pass, no ring wrap), then the last cold_rows here as flush does. True: the caller drafts its first block
++    /// from the cold rows alone (context begin at `cold_begin`) and the next frame waits for the staged rows' event.
++    pub fn flushStaged(m: *Model) !bool {
++        const b = &m.backend;
++        if (b.failed or b.frame.active or b.transaction != null or m.committed_end == 0 or m.session.context.end > m.committed_end) return false;
++        const c = m.graph.config;
++        const begin = m.committed_end -| (@as(u64, c.window) - 1);
++        const first = if (m.session.context.end < begin) begin else m.session.context.end;
++        if (m.committed_end - first <= 2 * cold_rows) return false;
++        const split = m.committed_end - cold_rows;
++        const slot: u32 = @intCast(first % c.window);
++        const rows: u32 = @intCast(split - first);
++        if (rows > flush_rows or slot + rows > c.window) return false;
++        const s = try m.stageQueue();
++        if (m.session.context.end < begin) {
++            m.session.context = .{ .cache = 1, .begin = begin, .end = begin };
++            m.session.ready = false;
++            b.context = m.session.context;
++        }
++        s.value += 1;
++        s.frame.wait_before = null;
++        s.frame.signal_after = .{ .ev = .{ .id = s.done.id }, .value = s.value };
++        var positions: [flush_rows]u64 = undefined;
++        for (positions[0..rows], 0..) |*position, i| position.* = first + i;
++        const stride = @as(usize, c.tapWidth()) * 2;
++        {
++            std.mem.swap(backend_mod.Frame, &b.frame, &s.frame);
++            b.in_stage = true;
++            defer {
++                b.in_stage = false;
++                std.mem.swap(backend_mod.Frame, &b.frame, &s.frame);
++            }
++            const view = try b.frame.borrow(.{ .buf = m.pending, .off = @as(usize, slot) * stride }, rows, c.tapWidth());
++            b.commit_no_wait = true;
++            defer b.commit_no_wait = false;
++            try m.session.absorb(b.ops(), &m.graph, m.preparation, .{ .values = view, .positions = positions[0..rows], .layers = c.taps, .target_end = split });
++        }
++        // the cold rows: the staged ones are not read by this frame's appends (each row's keys are its own)
++        try m.flush();
++        m.cold_begin = split;
++        return true;
++    }
+     /// The early frame's bridge spin, behind what the caller committed after the frame (Frame.early).
+     pub fn bridgeNext(m: *Model) void {
+         if (m.early != null) m.backend.frame.launchBridge();
+@@ -317,8 +482,25 @@ pub const Model = struct {
+             const view = try m.backend.frame.borrow(.{ .buf = m.pending, .off = @as(usize, slot) * stride }, rows, m.graph.config.tapWidth());
+             return m.session.absorbTreeBlock(m.allocator, m.backend.ops(), &m.graph, m.preparation, .{ .values = view, .positions = positions[0..rows], .layers = m.graph.config.taps, .target_end = m.session.context.end + rows }, pending, block, .{ .nodes = nodes, .children = policy.children, .floor = policy.floor });
+         }
+-        try m.flush();
++        const staged = m.flushStaged() catch |err| blk: {
++            std.log.warn("staged catch-up refused: {s}", .{@errorName(err)});
++            break :blk false;
++        };
++        if (!staged) try m.flush();
+         const first = try m.session.firstDraw();
++        // a staged catch-up's first block attends to the cold rows alone; the full context is back for the next frame
++        const full = m.session.context;
++        if (m.cold_begin) |cb| {
++            m.session.context.begin = cb;
++            m.backend.context.begin = cb;
++        }
++        defer if (m.cold_begin != null) {
++            m.cold_begin = null;
++            m.session.context = full;
++            m.backend.context = full;
++            // the next frame reads the staged rows: its command buffers wait for them
++            if (m.backend.stage) |*st| m.backend.wait_once = .{ .ev = .{ .id = st.done.id }, .value = st.value };
++        };
+         return m.session.treeBlock(m.allocator, m.backend.ops(), &m.graph, m.preparation, pending, first, block, .{ .nodes = nodes, .children = policy.children, .floor = policy.floor });
+     }
+ };

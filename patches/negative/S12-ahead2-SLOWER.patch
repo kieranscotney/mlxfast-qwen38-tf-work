@@ -1,0 +1,42 @@
+diff --git a/Vendor/TensorFold/zig/kernels/metal/core/lane_projection.metal b/Vendor/TensorFold/zig/kernels/metal/core/lane_projection.metal
+index 0bf76f2..6d97359 100644
+--- a/Vendor/TensorFold/zig/kernels/metal/core/lane_projection.metal
++++ b/Vendor/TensorFold/zig/kernels/metal/core/lane_projection.metal
+@@ -344,6 +344,12 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
+ #if defined(TF_SERIAL_SK2) && defined(TF_ROWS8) && defined(TF_REG_LEAN) && !defined(TF_PROMPT_SR)
+ #define TF_CHAIN_WALK 1
+ #endif
++// TF_AHEAD2: decoded rows of a parallel K split keep two groups' codes in flight (only when the load moves; no word changes)
++#if defined(TF_ROWS8) && defined(TF_REG_LEAN) && !defined(TF_PROMPT_SR) && !defined(TF_CHAIN_WALK) && TF_BITS == 4 && !defined(TF_SWIGLU)
++#define TF_AHEAD2 1
++#else
++#define TF_AHEAD2 0
++#endif
+ #if defined(TF_GU_TURNS)
+ [[max_total_threads_per_threadgroup(64)]]
+ #elif defined(TF_SWIGLU)
+@@ -456,6 +462,11 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
+   const int end = last;
+   uint4 nw0 = 0, nw1 = 0;
+   if (first < last) { nw0 = wl[(size_t)first * TF_TB * TF_RW]; nw1 = TF_BITS == 2 ? uint4(0) : wl[(size_t)first * TF_TB * TF_RW + 32]; }
++#if TF_AHEAD2
++  // a second group's codes in flight: the words of group min(g + 2, end - 1) load while group g computes
++  uint4 mw0 = 0, mw1 = 0;
++  if (first < last) { const size_t g1 = (size_t)min(first + 1, end - 1) * TF_TB * TF_RW; mw0 = wl[g1]; mw1 = wl[g1 + 32]; }
++#endif
+ #if defined(TF_SBI12)
+   const device uint* tab = (const device uint*)SB;
+   const device packed_uint3* ixs = (const device packed_uint3*)(tab + TF_SBI) + n0 / 8 + nb / 4;
+@@ -523,8 +534,12 @@ inline tf_reg_load tf_reg_fetch(const device uint4* wl, const device uint4* sbv,
+     cp += g + 1 < last ? TF_TB * TF_RW : 0;
+     nw0 = cp[0];
+     nw1 = TF_BITS == 2 ? uint4(0) : cp[32];
++#else
++#if TF_AHEAD2
++    { nw0 = mw0; nw1 = mw1; const size_t g2 = (size_t)min(g + 2, end - 1) * TF_TB * TF_RW; mw0 = wl[g2]; mw1 = wl[g2 + 32]; }
+ #else
+     { const int stay = int(g + 1 >= end); wp += (1 - stay) * TF_TB * TF_RW; nw0 = wp[0]; nw1 = TF_BITS == 2 ? uint4(0) : wp[32]; }
++#endif
+ #if defined(TF_SBI12)
+     ni = ixs[(size_t)min(g + 1, end - 1) * (TF_N / 8)];
+ #elif defined(TF_SBI)

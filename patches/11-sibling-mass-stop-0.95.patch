@@ -1,0 +1,38 @@
+From: Kieran Scotney
+Subject: Depth-one siblings stop once the offered drafter mass reaches 0.95
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 978dd5698372ac5f91b512298bcdb77e7c10cd82)
+
+---
+diff --git a/zig/src/families/qwen27/dflash/selector.zig b/zig/src/families/qwen27/dflash/selector.zig
+index 01e481d..095326a 100644
+--- a/zig/src/families/qwen27/dflash/selector.zig
++++ b/zig/src/families/qwen27/dflash/selector.zig
+@@ -5,6 +5,8 @@ const op = @import("operators.zig");
+ pub const Noise = struct { ptr: *anyopaque, draw: *const fn (*anyopaque, u64, u32) anyerror!f64 };
+ /// `floor`: a node offers a child whose drafter probability (the head's softmax over its row's top-k) is below it only
+ /// when that child is the node's best.
++/// Offered drafter probability mass after which a node offers no more children (floor > 0 only).
++pub const mass_stop: f64 = 0.95;
+ pub const Options = struct { nodes: u32 = 15, children: u32 = 4, tau: f64 = 1.5, edge: f64 = 0.6, noise_weight: f64 = 0.7, temperature: f64 = 1, noise: ?Noise = null, floor: f64 = 0 };
+ /// Candidate count and maximum draft-parent path length are independent.
+ pub const Policy = struct {
+@@ -173,11 +175,17 @@ fn expand(g: *const weights.Graph, lattice: op.Lattice, options: Options, first:
+     }
+     const children = @min(options.children, lattice.topk);
+     var offered: u32 = 0;
++    var mass: f64 = 0;
+     for (order[0..lattice.topk]) |i| {
+         if (offered == children) break;
+         if (offered > 0 and options.floor > 0 and drafter[i] < options.floor) continue;
+         try frontier.append(lattice.gpa, .{ .score = cumulative + scores[i], .parent = parent, .token = lattice.candidates[row + i], .depth = depth });
+         offered += 1;
++        // the offered drafter mass covers the row: further siblings would rarely land
++        if (options.floor > 0) {
++            mass += drafter[i];
++            if (mass >= mass_stop) break;
++        }
+     }
+ }
+ pub fn propose(gpa: std.mem.Allocator, g: *const weights.Graph, lattice: op.Lattice, anchor: u32, first_position: u64, options: Options) !Tree {

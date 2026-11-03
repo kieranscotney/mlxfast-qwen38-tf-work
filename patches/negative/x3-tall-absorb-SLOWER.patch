@@ -1,0 +1,67 @@
+From: Kieran Scotney
+Subject: A prompt absorb's projections in one launch of every row behind one sums pass (lane_projection.encodeTall)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+---
+diff --git a/zig/src/core/lane_projection.zig b/zig/src/core/lane_projection.zig
+index 8f3c309..36ec761 100644
+--- a/zig/src/core/lane_projection.zig
++++ b/zig/src/core/lane_projection.zig
+@@ -631,6 +631,36 @@ pub const Projection = struct {
+ 
+     /// Only the group sums of `x` into this projection's sums buffer (what encode dispatches first), with no barrier: the
+     /// caller orders it before the encodeSums dispatches that read the returned sums.
++    /// A prompt-loop (prompt_sr) launch of any number of rows: one sums pass over every row into `sums` (the caller's
++    /// [group_count, 16 * blocks] f32 words), one barrier, one launch over every 16-row block. Each block's words are
++    /// the ones a reg_rows-row launch of it computes.
++    pub fn encodeTall(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, y: Ref, rows: u32, sums: Ref) !void {
++        if (!p.reg or p.rows8 or p.residual or p.count or p.tile_list) return error.InvalidSchedule;
++        const pipe = p.sums_pipe orelse return error.SumsNeedReg;
++        if (rows == 0) return error.InvalidRows;
++        const blocks = (rows + 15) / 16;
++        const stride: u32 = 16 * blocks;
++        try checkRef(x, rows * p.k * 2, 2);
++        try checkRef(w, p.weight_bytes, 16);
++        try checkRef(sb, p.metadata_bytes, 16);
++        try checkRef(y, ((rows - 1) * p.y_stride + p.n) * p.output_bytes, p.output_bytes);
++        try checkRef(sums, @as(usize, stride) * p.group_count * 4, 4);
++        e.setPipeline(pipe);
++        e.setBuffer(x.buf, x.off, 0);
++        e.setValue(@as(i32, @intCast(rows)), 1);
++        e.setBuffer(sums.buf, sums.off, 2);
++        e.setValue(@as(i32, @intCast(stride)), 3);
++        e.dispatchThreads(.{ .width = stride * p.group_count }, .{ .width = 256 });
++        e.barrier();
++        e.setPipeline(p.pipe);
++        e.setBuffer(x.buf, x.off, 0);
++        e.setBuffer(w.buf, w.off, 1);
++        e.setBuffer(sb.buf, sb.off, 2);
++        e.setValue([2]i32{ @intCast(rows), @intCast(stride) }, 3);
++        e.setBuffer(y.buf, y.off, 4);
++        e.setBuffer(sums.buf, sums.off, 5);
++        e.dispatchGroups(mtl.Size.of(p.tile_count, blocks, 1), mtl.Size.of(p.threads_per_slice * p.sk, 1, 1));
++    }
+     pub fn encodeSumsOf(p: Projection, e: mtl.ComputeEncoder, x: Ref, rows: u32) !Sums {
+         return p.encodeSumsOfAt(e, x, rows, null);
+     }
+diff --git a/zig/src/families/qwen27/dflash/runtime_callbacks.zig b/zig/src/families/qwen27/dflash/runtime_callbacks.zig
+index e187875..7381da4 100644
+--- a/zig/src/families/qwen27/dflash/runtime_callbacks.zig
++++ b/zig/src/families/qwen27/dflash/runtime_callbacks.zig
+@@ -112,6 +112,15 @@ fn encodePrepared(b: *Backend, e: @import("metal").ComputeEncoder, x: op.View, y
+             b.input_sums = .{ .view = x, .sums = sums };
+         } else {
+             if (p.sums_buffer) |sb| b.access(e, &.{xs}, &.{ ys, Span.whole(sb) }) else b.access(e, &.{xs}, &.{ys});
++            // a prompt absorb on a reg adapter's prompt loop: every row in one launch behind one sums pass
++            if (x.rows > @import("core").lane_projection.reg_rows and x.stride == x.width and y.stride == y.width) if (adapter.prompt) |tall| {
++                const stride = 16 * ((x.rows + 15) / 16);
++                const sums = try b.frame.alloc(stride, @intCast(tall.group_count), .f32);
++                const sr = try b.frame.ref(sums);
++                b.access(e, &.{xs}, &.{ ys, try b.span(sums) });
++                try tall.encodeTall(e, .{ .buf = input.buf, .off = input.off }, .{ .buf = adapter.words }, .{ .buf = adapter.metadata }, .{ .buf = output.buf, .off = output.off }, x.rows, .{ .buf = sr.buf, .off = sr.off });
++                return;
++            };
+             // reg adapters take a prompt absorb's rows 128 at a time (16-row blocks on the grid, each block's words as alone)
+             const step: u32 = if (p.reg) @import("core").lane_projection.reg_rows else 16;
+             var first: u32 = 0;

@@ -1,0 +1,27 @@
+diff --git a/Vendor/TensorFold/zig/src/families/qwen27/dflash/generation.zig b/Vendor/TensorFold/zig/src/families/qwen27/dflash/generation.zig
+index 7e2378f..163190e 100644
+--- a/Vendor/TensorFold/zig/src/families/qwen27/dflash/generation.zig
++++ b/Vendor/TensorFold/zig/src/families/qwen27/dflash/generation.zig
+@@ -357,7 +357,16 @@ pub const Generation = struct {
+         // a depth-one round's keep (keepDevice, behind the verify) stashes its GDN rows for the next verifies' star scans
+         g.runner.defer_gdn = (policy.max_depth orelse 0) == 1;
+         defer g.runner.defer_gdn = false;
++        vprof_round += 1;
++        const vprof_on = vprof_round > 300 and vprof_round <= 320;
++        if (vprof_on) { vprof_trace.queue = g.runner.model.queue; g.runner.profile(&vprof_trace); }
+         const accepted = try g.verifyAccept(&round, ids, parents, policy.budget(remaining), eos, early);
++        if (vprof_on) g.runner.profile(null);
++        if (vprof_round == 320) {
++            const gp = @import("core").gpu_profile;
++            inline for (@typeInfo(gp.Class).@"enum".field_names, 0..) |name, ci| if (vprof_trace.calls[ci] > 0) std.log.warn("VPROF class {s} calls={d} us={d:.1}", .{ name, vprof_trace.calls[ci] / 20, vprof_trace.seconds[ci] * 1e6 / 20.0 });
++            for (vprof_trace.shapes[0..vprof_trace.shape_count]) |sh| std.log.warn("VPROF shape n={d} k={d} sk={d} calls={d} us={d:.1}", .{ sh.n, sh.k, sh.sk, sh.calls / 20, sh.gpu_seconds * 1e6 / 20.0 });
++        }
+         // a depth-bounded round that takes its whole budget stops at its length with the bonus emitted: that pick is the
+         // next round's pending token, as a bonus stop's is, so the next round need not take it from the logits again
+         g.pending = accepted.pending orelse accepted.bonus;
+@@ -435,3 +444,5 @@ test "true request budget keeps a verified non-prefix continuation across delive
+     try std.testing.expectEqualSlices(u32, &.{ 2, 3, 4 }, terminal.tokens);
+     try std.testing.expect(terminal.pending == null);
+ }
++var vprof_round: u64 = 0;
++var vprof_trace: @import("core").gpu_profile.Trace = .{ .queue = undefined, .enabled = true };

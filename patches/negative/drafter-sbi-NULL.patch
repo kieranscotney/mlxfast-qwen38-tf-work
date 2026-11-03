@@ -1,0 +1,158 @@
+diff --git a/Vendor/TensorFold/zig/src/core/affine4_lane.zig b/Vendor/TensorFold/zig/src/core/affine4_lane.zig
+index 51c66ca..addf1ca 100644
+--- a/Vendor/TensorFold/zig/src/core/affine4_lane.zig
++++ b/Vendor/TensorFold/zig/src/core/affine4_lane.zig
+@@ -3,10 +3,13 @@ const std = @import("std");
+ const mtl = @import("metal");
+ const lane = @import("core").lane_projection;
+ pub const cpu = @import("affine4.zig");
++/// Decoded windows' metadata in lane_projection.indexed_layout, on an indexed (TF_SBI) pipeline.
++pub const Indexed = struct { meta: mtl.Buffer, projection: lane.Projection };
+ pub const Adapter = struct {
+     projection: lane.Projection,
+     words: mtl.Buffer,
+     metadata: mtl.Buffer,
++    indexed: ?Indexed = null,
+     /// With `order`, the words are rewritten into reg_layout and encode on the reg kernel (same output words).
+     pub fn init(a: std.mem.Allocator, device: mtl.Device, prepared: cpu.Prepared, sk: usize, order: ?lane.RegOrder) !Adapter {
+         const layout = lane.Layout{ .n = prepared.n, .k = prepared.k, .format = .{ .bits = 4, .group = 64 }, .sk = sk, .precompute_sums = true, .cooperative = order == null, .reg = order != null, .reg_lean = order != null };
+@@ -20,7 +23,28 @@ pub const Adapter = struct {
+         const projection = try lane.Projection.init(a, device, layout);
+         return .{ .projection = projection, .words = words, .metadata = metadata };
+     }
++    /// Takes `meta` (indexed_layout, owned from here) and adds the indexed pipeline that decoded windows use.
++    pub fn withIndexed(adapter: *Adapter, a: std.mem.Allocator, device: mtl.Device, meta: mtl.Buffer) !void {
++        const p = adapter.projection;
++        if (!p.reg) return error.InvalidSchedule;
++        const layout = lane.Layout{
++            .n = p.n,
++            .k = p.k,
++            .format = .{ .bits = 4, .group = 64 },
++            .sk = p.sk,
++            .precompute_sums = true,
++            .reg = true,
++            .reg_lean = true,
++            .indexed = true,
++        };
++        const projection = try lane.Projection.init(a, device, layout);
++        adapter.indexed = .{ .meta = meta, .projection = projection };
++    }
+     pub fn deinit(adapter: Adapter) void {
++        if (adapter.indexed) |x| {
++            x.projection.deinit();
++            x.meta.deinit();
++        }
+         adapter.projection.deinit();
+         adapter.words.deinit();
+         adapter.metadata.deinit();
+diff --git a/Vendor/TensorFold/zig/src/families/qwen27/dflash/runtime_backend.zig b/Vendor/TensorFold/zig/src/families/qwen27/dflash/runtime_backend.zig
+index d7efa5c..e12281f 100644
+--- a/Vendor/TensorFold/zig/src/families/qwen27/dflash/runtime_backend.zig
++++ b/Vendor/TensorFold/zig/src/families/qwen27/dflash/runtime_backend.zig
+@@ -227,7 +227,8 @@ pub const Backend = struct {
+             try st.put(b.allocator, owned, .{ .prepared = dup, .key = key });
+         };
+         if (order) |o| {
+-            const adapter = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, prepared_words, try @import("../projection.zig").split(shape[0], shape[1]), o);
++            var adapter = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, prepared_words, try @import("../projection.zig").split(shape[0], shape[1]), o);
++            try attachIndexed(b.allocator, b.target.device, &adapter);
+             try @import("../residency.zig").putPrepared(b, key, adapter);
+         } else {
+             const t = try Tiled.init(b.target.device, prepared_words);
+@@ -271,7 +272,8 @@ pub const Backend = struct {
+         }
+         const key = (st.get(try std.fmt.bufPrint(&buf, "{d}{c}", .{ layer, key_part })).?).key + kind;
+         const joined = core.affine4.Prepared{ .allocator = b.allocator, .n = n, .k = k, .words = words, .scales = scales, .biases = biases };
+-        const adapter = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, joined, try @import("../projection.zig").split(n, k), order);
++        var adapter = try core.affine4_lane.Adapter.init(b.allocator, b.target.device, joined, try @import("../projection.zig").split(n, k), order);
++        try attachIndexed(b.allocator, b.target.device, &adapter);
+         try @import("../residency.zig").putPrepared(b, key, adapter);
+         b.fused_count += 1;
+     }
+@@ -335,3 +337,14 @@ pub const Backend = struct {
+         try b.target.glue.unstack(e, .{ .buffer = x.buf, .offset = x.off }, .{ .buffer = y.buf, .offset = y.off }, .{ .rows = rows, .width = width, .stride = stride, .offset = 0 });
+     }
+ };
++
++/// A reg adapter's metadata also in lane_projection.indexed_layout, for the drafter's decoded windows.
++fn attachIndexed(a: std.mem.Allocator, device: @import("metal").Device, adapter: *core.affine4_lane.Adapter) !void {
++    const p = adapter.projection;
++    if (!p.reg) return;
++    var scratch: std.ArrayList(@import("metal").Buffer) = .empty;
++    defer scratch.deinit(a);
++    const pair = adapter.metadata.slice(u16, p.n * (p.k / 64) * 2);
++    const meta = (try @import("../projection.zig").indexPairs(device, a, &scratch, pair, p.n, p.k)) orelse return;
++    try adapter.withIndexed(a, device, meta);
++}
+diff --git a/Vendor/TensorFold/zig/src/families/qwen27/dflash/runtime_callbacks.zig b/Vendor/TensorFold/zig/src/families/qwen27/dflash/runtime_callbacks.zig
+index 2ae6e2b..06c6aab 100644
+--- a/Vendor/TensorFold/zig/src/families/qwen27/dflash/runtime_callbacks.zig
++++ b/Vendor/TensorFold/zig/src/families/qwen27/dflash/runtime_callbacks.zig
+@@ -58,7 +58,10 @@ fn encodePrepared(b: *Backend, e: @import("metal").ComputeEncoder, x: op.View, y
+         const ys = try b.span(y);
+         const input = try b.frame.ref(x);
+         const output = try b.frame.ref(y);
+-        const p = adapter.projection;
++        // decoded windows read the metadata through the prefetched u16 index (TF_SBI), as the target's decoded rows do
++        const ix: ?@import("core").affine4_lane.Indexed = if (x.rows <= 16) adapter.indexed else null;
++        const p = if (ix) |v| v.projection else adapter.projection;
++        const meta: @import("core").lane_projection.Ref = if (ix) |v| .{ .buf = v.meta } else .{ .buf = adapter.metadata };
+         const cacheable = p.reg and p.sums_pipe != null and p.sums_buffer != null and
+             x.dtype == .bf16 and x.rows >= 1 and x.rows <= 16 and x.stride == x.width and
+             x.width == p.k and p.k % 64 == 0 and p.group_count == p.k / 64 and
+@@ -66,14 +69,14 @@ fn encodePrepared(b: *Backend, e: @import("metal").ComputeEncoder, x: op.View, y
+         if (!cacheable or (if (b.input_sums) |s| !std.meta.eql(s.view, x) else false)) b.input_sums = null;
+         if (b.input_sums) |s| {
+             b.access(e, &.{ xs, Span.whole(s.sums.ref.buf) }, &.{ys});
+-            try p.encodeSums(e, .{ .buf = input.buf, .off = input.off }, .{ .buf = adapter.words }, .{ .buf = adapter.metadata }, s.sums, .{ .buf = output.buf, .off = output.off }, x.rows);
++            try p.encodeSums(e, .{ .buf = input.buf, .off = input.off }, .{ .buf = adapter.words }, meta, s.sums, .{ .buf = output.buf, .off = output.off }, x.rows);
+         } else if (cacheable) {
+             // the sums, a barrier, the product: no barrier behind it, so independent work runs beside it
+             const sums_span = Span.whole(p.sums_buffer.?);
+             b.access(e, &.{xs}, &.{sums_span});
+             const sums = try p.encodeSumsOf(e, .{ .buf = input.buf, .off = input.off }, x.rows);
+             b.access(e, &.{ xs, sums_span }, &.{ys});
+-            try p.encodeSums(e, .{ .buf = input.buf, .off = input.off }, .{ .buf = adapter.words }, .{ .buf = adapter.metadata }, sums, .{ .buf = output.buf, .off = output.off }, x.rows);
++            try p.encodeSums(e, .{ .buf = input.buf, .off = input.off }, .{ .buf = adapter.words }, meta, sums, .{ .buf = output.buf, .off = output.off }, x.rows);
+             b.input_sums = .{ .view = x, .sums = sums };
+         } else {
+             if (p.sums_buffer) |sb| b.access(e, &.{xs}, &.{ ys, Span.whole(sb) }) else b.access(e, &.{xs}, &.{ys});
+diff --git a/Vendor/TensorFold/zig/src/families/qwen27/projection.zig b/Vendor/TensorFold/zig/src/families/qwen27/projection.zig
+index 6d5fdc8..6fac890 100644
+--- a/Vendor/TensorFold/zig/src/families/qwen27/projection.zig
++++ b/Vendor/TensorFold/zig/src/families/qwen27/projection.zig
+@@ -101,7 +101,7 @@ pub fn prepare(device: mtl.Device, allocator: std.mem.Allocator, owned: *std.Arr
+ 
+ /// lane_projection.indexed_layout of packed pairs ([K/64][N][scale, bias]): the distinct (scale | bias << 16) words in
+ /// first-seen order, then each group's u16 index. Null (nothing kept) past lane_projection.sb_table distinct pairs.
+-fn indexPairs(device: mtl.Device, allocator: std.mem.Allocator, owned: *std.ArrayList(mtl.Buffer), pair: []const u16, n: usize, k: usize) !?mtl.Buffer {
++pub fn indexPairs(device: mtl.Device, allocator: std.mem.Allocator, owned: *std.ArrayList(mtl.Buffer), pair: []const u16, n: usize, k: usize) !?mtl.Buffer {
+     const cap = lane.sb_table;
+     var seen = std.AutoHashMap(u32, u16).init(allocator);
+     defer seen.deinit();
+diff --git a/Vendor/TensorFold/zig/src/families/qwen27/residency.zig b/Vendor/TensorFold/zig/src/families/qwen27/residency.zig
+index bb14753..efc14e9 100644
+--- a/Vendor/TensorFold/zig/src/families/qwen27/residency.zig
++++ b/Vendor/TensorFold/zig/src/families/qwen27/residency.zig
+@@ -35,6 +35,10 @@ pub fn appendDraft(b: anytype, a: std.mem.Allocator, list: *std.ArrayList(mtl.Bu
+     while (adapters.next()) |adapter| {
+         try fields.append(a, list, adapter);
+         try fields.append(a, list, &adapter.projection);
++        if (comptime @hasField(@TypeOf(adapter.*), "indexed")) if (adapter.indexed) |*x| {
++            try list.append(a, x.meta);
++            try fields.append(a, list, &x.projection);
++        };
+     }
+     var tiled = b.tiled.valueIterator();
+     while (tiled.next()) |t| try fields.append(a, list, t);
+@@ -54,6 +58,10 @@ fn draftBuffers(b: anytype, hook: mtl.ResidencySet.Follow, joining: bool) void {
+ pub fn prepared(adapter: anytype, hook: mtl.ResidencySet.Follow, joining: bool) void {
+     fields.apply(adapter, hook, joining);
+     fields.apply(&adapter.projection, hook, joining);
++    if (comptime @hasField(@TypeOf(adapter.*), "indexed")) if (adapter.indexed) |*x| {
++        fields.one(x.meta, hook, joining);
++        fields.apply(&x.projection, hook, joining);
++    };
+ }
+ 
+ pub fn putPrepared(b: anytype, key: usize, adapter: anytype) !void {

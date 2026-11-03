@@ -1,0 +1,69 @@
+diff --git a/Vendor/TensorFold/zig/kernels/metal/core/shared_attention.metal b/Vendor/TensorFold/zig/kernels/metal/core/shared_attention.metal
+index de2bbd3..acf90fd 100644
+--- a/Vendor/TensorFold/zig/kernels/metal/core/shared_attention.metal
++++ b/Vendor/TensorFold/zig/kernels/metal/core/shared_attention.metal
+@@ -81,6 +81,56 @@ inline void tf_context_row(const device bfloat* Q, const device bfloat* K, const
+   const uint kh = tg.x, row = tg.y, chunk = tg.z, chunks = (args.keys + TF_CHUNK - 1) / TF_CHUNK;
+   if (kh >= TF_KVH || row >= args.rows || chunk >= chunks) return;
+   const float scale = as_type<float>(args.scale_bits);
++#if TF_CHUNK == 64 && TF_D % 32 == 0
++  // a lane per key: each lane scores its two keys for every query head with no reductions, the chunk's softmax takes one
++  // max and one sum a head, and the weighted values accumulate over the chunk's keys with each weight broadcast by shuffle
++  threadgroup float qs[TF_G * TF_D];
++  for (uint g = 0; g < TF_G; ++g) {
++    const size_t qi = ((size_t)row * TF_QH + kh * TF_G + g) * TF_D;
++    for (uint d = lane; d < TF_D; d += 32) qs[g * TF_D + d] = float(Q[qi + d]);
++  }
++  simdgroup_barrier(mem_flags::mem_threadgroup);
++  const uint base = chunk * TF_CHUNK, last = min(args.keys, base + TF_CHUNK);
++  float score[2][TF_G];
++  for (uint h = 0; h < 2; ++h) {
++    const uint key = base + h * 32 + lane;
++    const bool live = key < last && mask[(size_t)row * args.mask_stride + key] != 0;
++    float dot[TF_G];
++    for (uint g = 0; g < TF_G; ++g) dot[g] = 0.0f;
++    if (live) {
++      const device bfloat4* kr = (const device bfloat4*)(K + ((size_t)key * TF_KVH + kh) * TF_D);
++      for (uint d4 = 0; d4 < TF_D / 4; ++d4) {
++        const float4 kv = float4(kr[d4]);
++        for (uint g = 0; g < TF_G; ++g) {
++          const threadgroup float* qg = qs + g * TF_D + d4 * 4;
++          dot[g] = fma(qg[0], kv.x, fma(qg[1], kv.y, fma(qg[2], kv.z, fma(qg[3], kv.w, dot[g]))));
++        }
++      }
++    }
++    for (uint g = 0; g < TF_G; ++g) score[h][g] = live ? dot[g] * scale : -INFINITY;
++  }
++  float weight[2][TF_G], maximum[TF_G], total[TF_G], out[TF_G][TF_D / 32];
++  for (uint g = 0; g < TF_G; ++g) {
++    maximum[g] = simd_max(max(score[0][g], score[1][g]));
++    for (uint h = 0; h < 2; ++h) weight[h][g] = maximum[g] == -INFINITY ? 0.0f : exp(score[h][g] - maximum[g]);
++    total[g] = simd_sum(weight[0][g] + weight[1][g]);
++    for (uint d = 0; d < TF_D / 32; ++d) out[g][d] = 0.0f;
++  }
++  for (uint h = 0; h < 2; ++h)
++    for (uint j = 0; j < 32; ++j) {
++      const uint key = base + h * 32 + j;
++      if (key >= last) break;
++      float w[TF_G];
++      bool any = false;
++      for (uint g = 0; g < TF_G; ++g) { w[g] = simd_shuffle(weight[h][g], ushort(j)); any = any || w[g] != 0.0f; }
++      if (!any) continue;
++      const size_t vi = ((size_t)key * TF_KVH + kh) * TF_D;
++      for (uint d = 0; d < TF_D / 32; ++d) {
++        const float v = float(V[vi + lane + d * 32]);
++        for (uint g = 0; g < TF_G; ++g) out[g][d] = fma(w[g], v, out[g][d]);
++      }
++    }
++#else
+   float q[TF_G][TF_D / 32], out[TF_G][TF_D / 32], maximum[TF_G], total[TF_G];
+   for (uint g = 0; g < TF_G; ++g) {
+     const size_t qi = ((size_t)row * TF_QH + kh * TF_G + g) * TF_D;
+@@ -106,6 +156,7 @@ inline void tf_context_row(const device bfloat* Q, const device bfloat* K, const
+       maximum[g] = next;
+     }
+   }
++#endif
+   // partials [row][kv head][chunk][query head][D + 2]: outputs, then the chunk's maximum and total
+   for (uint g = 0; g < TF_G; ++g) {
+     device float* p = part + ((((size_t)row * TF_KVH + kh) * chunks + chunk) * TF_G + g) * (TF_D + 2);

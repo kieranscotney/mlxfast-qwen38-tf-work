@@ -1,0 +1,262 @@
+diff --git a/Vendor/TensorFold/zig/src/families/qwen27/dflash/execution.zig b/Vendor/TensorFold/zig/src/families/qwen27/dflash/execution.zig
+index d292cee..03990d1 100644
+--- a/Vendor/TensorFold/zig/src/families/qwen27/dflash/execution.zig
++++ b/Vendor/TensorFold/zig/src/families/qwen27/dflash/execution.zig
+@@ -139,13 +139,18 @@ fn encodeStreams(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, st
+         for (positions[k * block ..][0..block], 0..) |*p, i| p.* = try std.math.add(u64, s.context.end, i);
+     }
+     for (given, 1..) |t, i| ids[i] = t;
++    const DG = @import("generation.zig");
++    var dt = DG.diagNow();
+     var hidden = try ops.vtable.embed(ops.ptr, frame, g.embed, ids[0..rows]);
+     try hidden.check(rows, c.hidden, .bf16);
++    dlog("embed", &dt);
+     for (g.layers, 0..) |layer, i| {
++        dlog("layerstart", &dt);
+         var residual = hidden;
+         const xn = try norm(ops, frame, hidden, layer.input_norm, c.eps, 1, c.hidden);
+         const dynamic = try project(ops, frame, xn, layer.attention_conv.projection, preparation.mode);
+         const input = try convolve(ops, frame, xn, dynamic, layer.attention_conv, 0, null, c, block);
++        dlog("norm+dynproj+conv", &dt);
+         var raw_q: op.View = undefined;
+         var raw_k: op.View = undefined;
+         var values: op.View = undefined;
+@@ -158,10 +163,13 @@ fn encodeStreams(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, st
+             raw_k = try project(ops, frame, input, layer.attention.k, preparation.mode);
+             values = try project(ops, frame, input, layer.attention.v, preparation.mode);
+         }
++        dlog("qkv", &dt);
+         const query = try rotate(ops, frame, try norm(ops, frame, raw_q, layer.attention.q_norm, c.eps, c.heads, c.head_dim), positions[0..rows], c.heads, c);
+         const keys = try rotate(ops, frame, try norm(ops, frame, raw_k, layer.attention.k_norm, c.eps, c.kv_heads, c.head_dim), positions[0..rows], c.kv_heads, c);
++        dlog("qk norm rope", &dt);
+         const attended = try ops.vtable.attention(ops.ptr, frame, .{ .context = streams[0].context, .config = c, .layer = @intCast(i), .query = query, .keys = keys, .values = values, .positions = positions[0..rows], .streams = if (n > 1) contexts[0..n] else &.{}, .block = block });
+         try attended.check(rows, c.qWidth(), .bf16);
++        dlog("attention", &dt);
+         hidden = try convolve(ops, frame, try project(ops, frame, attended, layer.attention.o, preparation.mode), dynamic, layer.attention_conv, 1, residual, c, block);
+         residual = hidden;
+         const post = try norm(ops, frame, hidden, layer.post_norm, c.eps, 1, c.hidden);
+@@ -176,19 +184,24 @@ fn encodeStreams(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, st
+             gate = try project(ops, frame, mlp_input, layer.mlp.gate, preparation.mode);
+             up = try project(ops, frame, mlp_input, layer.mlp.up, preparation.mode);
+         }
++        dlog("o+post+mlpgateup", &dt);
+         const activated = try ops.vtable.swiglu(ops.ptr, frame, gate, up);
+         try activated.check(rows, c.intermediate, .bf16);
+         hidden = try convolve(ops, frame, try project(ops, frame, activated, layer.mlp.down, preparation.mode), dyn_mlp, layer.mlp_conv, 1, residual, c, block);
+     }
++    dlog("layers end", &dt);
+     // one stream heads only its mask rows; a batch heads every row and each stream's lattice skips its anchor
+     const masks = if (n == 1) try ops.vtable.mask_rows(ops.ptr, frame, hidden, 1, block - 1) else hidden;
+     const headed = if (n == 1) block - 1 else rows;
+     try masks.check(headed, c.hidden, .bf16);
+     const final = try norm(ops, frame, masks, g.norm, c.eps, 1, c.hidden);
++    dlog("maskrows+norm", &dt);
+     const head = try ops.vtable.head(ops.ptr, frame, final);
++    dlog("head", &dt);
+     if (head.logits.handle == 0 or head.logits.rows != headed or head.logits.dtype != .bf16 or head.logits.width == 0 or head.logits.width > c.vocab or head.logits.stride < head.logits.width) return error.DraftOperatorShape;
+     if (head.token_ids) |mapping| try mapping.check(1, head.logits.width, .u32) else if (head.logits.width != c.vocab) return error.DraftCandidateId;
+     const projected = try project(ops, frame, final, g.hidden_projection, preparation.mode);
++    dlog("hidden_projection", &dt);
+     return .{ .head = head, .projected = projected };
+ }
+ /// A stream's new taps for a batched pass: absorbed into its caches before its block reads them.
+@@ -221,11 +234,17 @@ pub fn forwardTo(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, co
+ }
+ pub fn forwardBlock(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, context: op.Context, anchor: u32, block: u32) !op.Lattice {
+     if (block < 2 or block > 16) return error.BadRuntimeBlock;
++    const G = @import("generation.zig");
++    const t0 = G.diagNow();
+     const frame = try start(ops, g, preparation, context, anchor);
+     defer ops.vtable.release(ops.ptr, frame);
++    const t1 = G.diagNow();
+     const output = try encode(ops, g, preparation, context, anchor, frame, block, &.{});
++    const t2 = G.diagNow();
+     var lattice = try ops.vtable.lattice(ops.ptr, frame, output.head, output.projected, g.config);
+     errdefer lattice.deinit();
++    const t3 = G.diagNow();
++    if (t3 - t0 > 5_000_000) std.log.warn("DIAG fwdBlock start_ms={d:.3} encode_ms={d:.3} lattice_ms={d:.3}", .{ @as(f64, @floatFromInt(t1 - t0)) / 1e6, @as(f64, @floatFromInt(t2 - t1)) / 1e6, @as(f64, @floatFromInt(t3 - t2)) / 1e6 });
+     try lattice.check(g.config);
+     return lattice;
+ }
+@@ -243,3 +262,9 @@ pub fn forwardGiven(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation,
+ pub fn forward(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, context: op.Context, anchor: u32) !op.Lattice {
+     return forwardBlock(ops, g, preparation, context, anchor, g.config.block);
+ }
++
++fn dlog(comptime what: []const u8, t: *i128) void {
++    const now = @import("generation.zig").diagNow();
++    if (now - t.* > 2_000_000) std.log.warn("DIAG encode {s} ms={d:.3}", .{ what, @as(f64, @floatFromInt(now - t.*)) / 1e6 });
++    t.* = now;
++}
+diff --git a/Vendor/TensorFold/zig/src/families/qwen27/dflash/generation.zig b/Vendor/TensorFold/zig/src/families/qwen27/dflash/generation.zig
+index aebf24f..4adb0f0 100644
+--- a/Vendor/TensorFold/zig/src/families/qwen27/dflash/generation.zig
++++ b/Vendor/TensorFold/zig/src/families/qwen27/dflash/generation.zig
+@@ -132,12 +132,23 @@ pub const Generation = struct {
+         g.pending = null;
+         std.debug.assert(g.keep == null);
+         if (g.runner.failed or g.draft.backend.failed or g.draft.backend.frame.active or g.draft.backend.transaction != null or g.draft.committed_end != 0 or g.runner.offsets[0] != 0 or chunk == 0 or chunk > g.runner.model.frame.capacity) return error.BadDraftContext;
++        const gp = @import("core").gpu_profile;
++        var diag_trace = gp.Trace{ .queue = g.runner.model.queue, .enabled = true };
++        const diag = true;
++        if (diag) g.runner.profile(&diag_trace);
++        const t0 = diagNow();
+         var first: usize = 0;
+         while (first < ids.len) {
+             const count = @min(ids.len - first, g.runner.promptRows(@intCast(chunk)));
+             try g.promptChunk(ids[first..][0..count], first + count == ids.len);
+             first += count;
+         }
++        if (diag) {
++            g.runner.profile(null);
++            std.log.warn("DIAG prefill rows={d} wall_ms={d:.2}", .{ ids.len, @as(f64, @floatFromInt(diagNow() - t0)) / 1e6 });
++            inline for (@typeInfo(gp.Class).@"enum".field_names, 0..) |name, i| std.log.warn("DIAG class {s} calls={d} ms={d:.2}", .{ name, diag_trace.calls[i], diag_trace.seconds[i] * 1e3 });
++            for (diag_trace.shapes[0..diag_trace.shape_count]) |sh| std.log.warn("DIAG shape n={d} k={d} sk={d} bits={d} calls={d} ms={d:.2}", .{ sh.n, sh.k, sh.sk, sh.bits, sh.calls, sh.gpu_seconds * 1e3 });
++        }
+     }
+     /// Ends a pending keep and forgets the picked token, before anything but runRound uses the slot.
+     pub fn settle(g: *Generation) !void {
+@@ -242,6 +253,7 @@ pub const Generation = struct {
+         if (available == 0) return error.ContextFull;
+         const offered: u32 = @intCast(@min(nodes, available - 1));
+         if (g.journal) |journal| try journal.reserve(g.allocator, 1);
++        const d0 = diagNow();
+         var tree = if (g.proposer) |proposer| try proposer.call(proposer.ptr, pending, offered) else try g.draft.propose(pending, offered);
+         defer tree.deinit();
+         const drafted = try tree.verifyParents(g.allocator);
+@@ -272,9 +284,24 @@ pub const Generation = struct {
+         var round = try Round.init(g.allocator, &.{.{ .slot = 0, .start = g.runner.offsets[0], .capacity = g.runner.capacity, .ids = ids, .parents = parents }}, @intCast(g.runner.model.config.conv_kernel), g.runner.slots, @intCast(g.runner.model.config.vocab));
+         defer round.deinit();
+         errdefer g.finishKeep() catch {};
++        const d1 = diagNow();
+         try g.finishKeep();
++        const d2 = diagNow();
+         const accepted = try g.verifyAccept(&round, ids, parents, remaining, eos);
++        const d3 = diagNow();
+         g.pending = accepted.pending;
++        if (d1 - d0 > 8_000_000) std.log.warn("DIAG slow propose_ms={d:.3} offset={d}", .{ @as(f64, @floatFromInt(d1 - d0)) / 1e6, g.runner.offsets[0] });
++        diag_acc[0] += @floatFromInt(d1 - d0);
++        diag_acc[1] += @floatFromInt(d2 - d1);
++        diag_acc[2] += @floatFromInt(d3 - d2);
++        diag_acc[3] += g.runner.last_gpu_seconds * 1e9;
++        diag_acc[4] += @floatFromInt(accepted.tokens.len);
++        diag_n += 1;
++        if (diag_n == 64) {
++            std.log.warn("DIAG rounds=64 propose_ms={d:.3} keepwait_ms={d:.3} verifyaccept_ms={d:.3} verify_gpu_ms={d:.3} tok_per_round={d:.3}", .{ diag_acc[0] / 64e6, diag_acc[1] / 64e6, diag_acc[2] / 64e6, diag_acc[3] / 64e6, diag_acc[4] / 64 });
++            diag_n = 0;
++            diag_acc = @splat(0);
++        }
+         if (accepted.path.len == 0 or accepted.tokens.len == 0 or accepted.tokens.len > @min(@import("core").tree_round.max_rows, remaining)) return error.EmptyAcceptedDraft;
+         var landed: u32 = 0;
+         for (accepted.path) |row| landed += @intFromBool(row >= drafted.len);
+@@ -347,3 +374,11 @@ test "true request budget keeps a verified non-prefix continuation across delive
+     try std.testing.expectEqualSlices(u32, &.{ 2, 3, 4 }, terminal.tokens);
+     try std.testing.expect(terminal.pending == null);
+ }
++
++pub fn diagNow() i128 {
++    var ts: std.c.timespec = undefined;
++    _ = std.c.clock_gettime(.MONOTONIC, &ts);
++    return @as(i128, ts.sec) * 1_000_000_000 + ts.nsec;
++}
++var diag_acc: [5]f64 = @splat(0);
++var diag_n: usize = 0;
+diff --git a/Vendor/TensorFold/zig/src/families/qwen27/dflash/runtime_backend.zig b/Vendor/TensorFold/zig/src/families/qwen27/dflash/runtime_backend.zig
+index 1daab63..4399e3c 100644
+--- a/Vendor/TensorFold/zig/src/families/qwen27/dflash/runtime_backend.zig
++++ b/Vendor/TensorFold/zig/src/families/qwen27/dflash/runtime_backend.zig
+@@ -93,6 +93,8 @@ pub const Backend = struct {
+         errdefer topk.deinit();
+         var head = try @import("runtime_head.zig").Head.init(a, target.device, target.weights.head);
+         errdefer head.deinit();
++        // the trimmed head's shape is the drafter's own: its pipeline compiles here, not in the first timed round
++        try target.kernels.prepareDecode(head.linear);
+         const caches = try newCaches(a, target.device, c, c.layers);
+         return .{ .allocator = a, .target = target, .checkpoint = checkpoint, .config = c, .primitives = primitives, .attention = attention, .topk = topk, .head = head, .frame = .{ .allocator = a, .device = target.device, .queue = target.queue }, .caches = caches };
+     }
+diff --git a/Vendor/TensorFold/zig/src/families/qwen27/dflash/runtime_model.zig b/Vendor/TensorFold/zig/src/families/qwen27/dflash/runtime_model.zig
+index 26bec42..bf98685 100644
+--- a/Vendor/TensorFold/zig/src/families/qwen27/dflash/runtime_model.zig
++++ b/Vendor/TensorFold/zig/src/families/qwen27/dflash/runtime_model.zig
+@@ -107,7 +107,9 @@ pub const Model = struct {
+             var positions: [128]u64 = undefined;
+             for (positions[0..rows], 0..) |*position, i| position.* = first + i;
+             const view = try m.backend.frame.borrow(.{ .buf = m.pending, .off = @as(usize, slot) * stride }, rows, m.graph.config.tapWidth());
++            const a0 = @import("generation.zig").diagNow();
+             try m.session.absorb(m.backend.ops(), &m.graph, m.preparation, .{ .values = view, .positions = positions[0..rows], .layers = m.graph.config.taps, .target_end = first + rows });
++            std.log.warn("DIAG flush chunk rows={d} ms={d:.3}", .{ rows, @as(f64, @floatFromInt(@import("generation.zig").diagNow() - a0)) / 1e6 });
+         }
+     }
+     pub fn setTreeBlock(m: *Model, block: u32) !void {
+diff --git a/Vendor/TensorFold/zig/src/families/qwen27/dflash/session.zig b/Vendor/TensorFold/zig/src/families/qwen27/dflash/session.zig
+index 76c1853..987901f 100644
+--- a/Vendor/TensorFold/zig/src/families/qwen27/dflash/session.zig
++++ b/Vendor/TensorFold/zig/src/families/qwen27/dflash/session.zig
+@@ -50,9 +50,15 @@ pub const Session = struct {
+     }
+     pub fn treeBlock(s: Session, gpa: std.mem.Allocator, ops: op.Ops, graph: *const weights.Graph, preparation: op.Preparation, pending: u32, first_draw: u64, block: u32, options: selector.Options) !selector.Tree {
+         if (!std.meta.eql(s.config, graph.config) or first_draw != try s.firstDraw()) return error.BadDraftPosition;
++        const G = @import("generation.zig");
++        const t0 = G.diagNow();
+         var lattice = try execution.forwardBlock(ops, graph, preparation, s.context, pending, block);
+         defer lattice.deinit();
+-        return selector.propose(gpa, graph, lattice, pending, first_draw, options);
++        const t1 = G.diagNow();
++        const r = selector.propose(gpa, graph, lattice, pending, first_draw, options);
++        const t2 = G.diagNow();
++        if (t2 - t0 > 5_000_000) std.log.warn("DIAG treeBlock forward_ms={d:.3} select_ms={d:.3}", .{ @as(f64, @floatFromInt(t1 - t0)) / 1e6, @as(f64, @floatFromInt(t2 - t1)) / 1e6 });
++        return r;
+     }
+     pub fn tree(s: Session, gpa: std.mem.Allocator, ops: op.Ops, graph: *const weights.Graph, preparation: op.Preparation, pending: u32, first_draw: u64, options: selector.Options) !selector.Tree {
+         var lattice = try s.propose(ops, graph, preparation, pending, first_draw);
+diff --git a/Vendor/TensorFold/zig/src/families/qwen27/quant_gpu.zig b/Vendor/TensorFold/zig/src/families/qwen27/quant_gpu.zig
+index 941605b..867ac2d 100644
+--- a/Vendor/TensorFold/zig/src/families/qwen27/quant_gpu.zig
++++ b/Vendor/TensorFold/zig/src/families/qwen27/quant_gpu.zig
+@@ -200,16 +200,8 @@ pub const Kernels = struct {
+         }
+         const reg = p.bits == 4 and p.group == 64;
+         if (!reg and (skip > 0 or cut[1] > 0)) return error.BadCoreProjectionRows;
+-        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = if (reg) sk else p.slices, .skip = skip, .cut = cut, .bits = p.bits, .group = p.group };
+         const sums: ?Sums = if (reg) xs else null; // the non-reg kernel sums its own groups
+-        const half = p.n / 64;
+-        const ranges = [_][2]usize{ .{ skip, half - skip }, .{ half + skip, half - skip } };
+-        const entry = try k.lanes.getOrPut(k.allocator, key);
+-        if (!entry.found_existing) {
+-            errdefer _ = k.lanes.remove(key);
+-            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .ranges = if (skip > 0) &ranges else &.{}, .groups = if (cut[1] > 0) .{ cut[0], cut[1] } else null, .output = if (cut[1] > 0) .f32 else .bf16, .precompute_sums = reg, .reg = reg, .serial_sk2 = key.serialSk2() });
+-            k.joined(entry.value_ptr);
+-        }
++        const entry = try k.laneEntry(p, sk, skip, cut);
+         const step: u32 = if (entry.value_ptr.reg) lane.reg_rows else 16;
+         var first: u32 = 0;
+         while (first < rows) : (first += step) {
+@@ -222,6 +214,28 @@ pub const Kernels = struct {
+         try span.end();
+     }
+ 
++    /// The lane projection a reg or lane launch of `p` takes, compiled and cached on first request.
++    fn laneEntry(k: *Kernels, p: projection.Linear, sk: u32, skip: u32, cut: [2]u32) !std.AutoHashMapUnmanaged(Key, lane.Projection).GetOrPutResult {
++        const reg = p.bits == 4 and p.group == 64;
++        const key = Key{ .kind = .projection, .n = p.n, .k = p.k, .slices = if (reg) sk else p.slices, .skip = skip, .cut = cut, .bits = p.bits, .group = p.group };
++        const half = p.n / 64;
++        const ranges = [_][2]usize{ .{ skip, half - skip }, .{ half + skip, half - skip } };
++        const entry = try k.lanes.getOrPut(k.allocator, key);
++        if (!entry.found_existing) {
++            errdefer _ = k.lanes.remove(key);
++            entry.value_ptr.* = try lane.Projection.init(k.allocator, k.device, .{ .n = p.n, .k = p.k, .format = .{ .bits = p.bits, .group = p.group }, .sk = key.slices, .ranges = if (skip > 0) &ranges else &.{}, .groups = if (cut[1] > 0) .{ cut[0], cut[1] } else null, .output = if (cut[1] > 0) .f32 else .bf16, .precompute_sums = reg, .reg = reg, .serial_sk2 = key.serialSk2() });
++            k.joined(entry.value_ptr);
++        }
++        return entry;
++    }
++
++    /// Compiles, at load, the decode-row pipeline a later `quant` of `p` takes (no rows encoded): a shape only
++    /// one caller uses, such as the drafter's trimmed head, would otherwise compile on its first timed launch.
++    pub fn prepareDecode(k: *Kernels, p: projection.Linear) !void {
++        if (p.runs.len > 0 or p.raw != null or p.tile != 32) return;
++        _ = try k.laneEntry(p, p.slices, 0, .{ 0, 0 });
++    }
++
+     /// A mixed stack: each member its own product into its columns; row kernels write the fused rows at a stride.
+     fn quantRuns(k: *Kernels, input_encoder: mtl.ComputeEncoder, p: projection.Linear, x: Ref, xs: ?Sums, dims: Ref, y: Ref, rows: u32, skip: u32, cut: [2]u32) !void {
+         if (skip > 0 or cut[1] > 0 or rows == 0 or rows > 128) return error.BadCoreProjectionRows;

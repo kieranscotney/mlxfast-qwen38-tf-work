@@ -1,0 +1,31 @@
+diff --git a/Vendor/TensorFold/zig/src/families/qwen27/dflash/generation.zig b/Vendor/TensorFold/zig/src/families/qwen27/dflash/generation.zig
+index 2d9d1cf..55be3f3 100644
+--- a/Vendor/TensorFold/zig/src/families/qwen27/dflash/generation.zig
++++ b/Vendor/TensorFold/zig/src/families/qwen27/dflash/generation.zig
+@@ -16,6 +16,7 @@ pub const Result = struct { tokens: []u32, rounds: usize, verified: usize, match
+ pub const Extender = struct { ptr: *anyopaque, call: *const fn (*anyopaque, []const u32, u32) anyerror![]const u32 };
+ /// The weight of a round in Generation.accept_share, and the share below which frames draft on q4 copies.
+ const accept_step: f32 = 0.125;
++var acct: struct { rounds: usize = 0, landed: usize = 0, precise: usize = 0, rows: usize = 0, wall: f64 = 0, last: f64 = 0 } = .{};
+ const precise_below: f32 = 0.9;
+ pub const Generation = struct {
+     allocator: std.mem.Allocator,
+@@ -405,6 +406,18 @@ pub const Generation = struct {
+         if (accepted.path.len == 0 or accepted.tokens.len == 0 or accepted.tokens.len > @min(@import("core").tree_round.max_rows, remaining)) return error.EmptyAcceptedDraft;
+         g.accept_share += (@as(f32, @floatFromInt(@intFromBool(accepted.matched > 0))) - g.accept_share) * accept_step;
+         g.draft.backend.precise = g.accept_share < precise_below;
++        acct.rounds += 1;
++        acct.landed += @intFromBool(accepted.matched > 0);
++        acct.precise += @intFromBool(g.draft.backend.precise);
++        acct.rows += ids.len;
++        {
++            var t: std.c.timespec = undefined;
++            _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &t);
++            const now = @as(f64, @floatFromInt(t.sec)) + @as(f64, @floatFromInt(t.nsec)) * 1e-9;
++            if (acct.last != 0 and now - acct.last < 0.2) acct.wall += now - acct.last;
++            acct.last = now;
++        }
++        if (acct.rounds % 128 == 0) std.log.warn("ACCT rounds={d} landed={d} precise={d} rows={d} round_ms={d:.3}", .{ acct.rounds, acct.landed, acct.precise, acct.rows, acct.wall * 1e3 / @as(f64, @floatFromInt(acct.rounds - 1)) });
+         var landed: u32 = 0;
+         for (accepted.path) |row| landed += @intFromBool(row >= drafted.len);
+         const tokens = try g.allocator.dupe(u32, accepted.tokens);

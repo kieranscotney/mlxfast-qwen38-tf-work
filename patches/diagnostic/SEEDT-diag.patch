@@ -1,0 +1,29 @@
+diff --git a/Vendor/TensorFold/zig/src/core/bench_session_engine.zig b/Vendor/TensorFold/zig/src/core/bench_session_engine.zig
+index 15d8b66..dfc86f9 100644
+--- a/Vendor/TensorFold/zig/src/core/bench_session_engine.zig
++++ b/Vendor/TensorFold/zig/src/core/bench_session_engine.zig
+@@ -254,9 +254,12 @@ pub fn GenerationBinding(comptime generation: type) type {
+             try binding.ready();
+             try binding.resetNow();
+             binding.depth = depth;
++            const seed_t0 = seedNow();
+             try binding.generation.prefill(tokens, binding.chunk);
++            const seed_t1 = seedNow();
+             const result = try binding.generation.runRound(1, .{ .nodes = dflash_width, .children = dflash_width, .floor = dflash_floor, .max_depth = depth }, &.{}, false, null, 0);
+             defer binding.generation.allocator.free(result.tokens);
++            std.log.warn("SEEDT rows={d} prefill_ms={d:.2} round1_ms={d:.2}", .{ tokens.len, (seed_t1 - seed_t0) * 1e3, (seedNow() - seed_t1) * 1e3 });
+             if (result.tokens.len != 1) return error.BadDraftRound;
+             return result.tokens[0];
+         }
+@@ -513,4 +516,9 @@ const vtable: bench.BenchSession.VTable = .{
+     .closePhase = closePhaseFn,
+     .inspectPhase = inspectPhaseFn,
+     .reset = resetFn,
+-};
+\ No newline at end of file
++};
++fn seedNow() f64 {
++    var t: std.c.timespec = undefined;
++    _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &t);
++    return @as(f64, @floatFromInt(t.sec)) + @as(f64, @floatFromInt(t.nsec)) * 1e-9;
++}

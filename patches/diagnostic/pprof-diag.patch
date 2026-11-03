@@ -1,0 +1,24 @@
+diff --git a/Vendor/TensorFold/zig/src/families/qwen27/dflash/generation.zig b/Vendor/TensorFold/zig/src/families/qwen27/dflash/generation.zig
+index c0e077d..f02b66f 100644
+--- a/Vendor/TensorFold/zig/src/families/qwen27/dflash/generation.zig
++++ b/Vendor/TensorFold/zig/src/families/qwen27/dflash/generation.zig
+@@ -132,12 +132,18 @@ pub const Generation = struct {
+         g.pending = null;
+         std.debug.assert(g.keep == null);
+         if (g.runner.failed or g.draft.backend.failed or g.draft.backend.frame.active or g.draft.backend.transaction != null or g.draft.committed_end != 0 or g.runner.offsets[0] != 0 or chunk == 0 or chunk > g.runner.model.frame.capacity) return error.BadDraftContext;
++        const gp = @import("core").gpu_profile;
++        var diag_trace = gp.Trace{ .queue = g.runner.model.queue, .enabled = true };
++        g.runner.profile(&diag_trace);
+         var first: usize = 0;
+         while (first < ids.len) {
+             const count = @min(ids.len - first, g.runner.promptRows(@intCast(chunk)));
+             try g.promptChunk(ids[first..][0..count], first + count == ids.len);
+             first += count;
+-        }
++            g.runner.profile(null);
++        inline for (@typeInfo(gp.Class).@"enum".field_names, 0..) |name, ci| if (diag_trace.calls[ci] > 0) std.log.warn("PPROF rows={d} class {s} calls={d} ms={d:.2}", .{ ids.len, name, diag_trace.calls[ci], diag_trace.seconds[ci] * 1e3 });
++        for (diag_trace.shapes[0..diag_trace.shape_count]) |sh| std.log.warn("PPROF rows={d} shape n={d} k={d} sk={d} calls={d} ms={d:.2}", .{ ids.len, sh.n, sh.k, sh.sk, sh.calls, sh.gpu_seconds * 1e3 });
++    }
+     }
+     /// Ends a pending keep and forgets the picked token, before anything but runRound uses the slot.
+     pub fn settle(g: *Generation) !void {

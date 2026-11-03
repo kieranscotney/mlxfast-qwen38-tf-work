@@ -1,0 +1,32 @@
+From: Kieran Scotney
+Subject: Five staggered prompt segments (core/stagger.MAX 5)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+---
+diff --git a/zig/src/core/stagger.zig b/zig/src/core/stagger.zig
+index ab62eda..37d8c81 100644
+--- a/zig/src/core/stagger.zig
++++ b/zig/src/core/stagger.zig
+@@ -2,7 +2,7 @@
+ const std = @import("std");
+ 
+ /// Segments one chunk can take.
+-pub const MAX = 4;
++pub const MAX = 5;
+ 
+ /// Where layer i waits for the segment before: ahead of pre (it reads what that one wrote, a conv tail) or of the mixer.
+ pub const Wait = enum { pre, mixer };
+diff --git a/zig/src/families/qwen27/decode_round.zig b/zig/src/families/qwen27/decode_round.zig
+index d7d1e22..8679c22 100644
+--- a/zig/src/families/qwen27/decode_round.zig
++++ b/zig/src/families/qwen27/decode_round.zig
+@@ -15,7 +15,7 @@ const first_commit = 0;
+ /// projections.
+ const stagger_rows = 768;
+ /// Segments a staggered prompt pass takes by default (TF_Q27_STAGGER: 0 or 1 keeps one, up to core/stagger.MAX).
+-const stagger_parts = 3;
++const stagger_parts = 5;
+ const wts = @import("gpu_weights.zig");
+ const attn = @import("attention.zig");
+ const abi = @import("gdn_contract.zig");

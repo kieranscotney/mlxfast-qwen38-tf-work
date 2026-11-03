@@ -1,0 +1,197 @@
+diff --git a/Vendor/TensorFold/zig/src/families/qwen27/decode_round.zig b/Vendor/TensorFold/zig/src/families/qwen27/decode_round.zig
+index b786542..9d1468e 100644
+--- a/Vendor/TensorFold/zig/src/families/qwen27/decode_round.zig
++++ b/Vendor/TensorFold/zig/src/families/qwen27/decode_round.zig
+@@ -348,7 +348,8 @@ pub const Runner = struct {
+         }
+         e.barrier();
+         const plan = @import("gdn_pool_gpu.zig").DevicePlan{ .host = recurrent, .metadata = m };
+-        for (0..r.gdn.budget.layers) |gi| try r.gdn.commitScan(gi, plan, e);
++        // the replays run in the next forward (Pool.replayPending), beside the scans; the conv windows here
++        try r.gdn.commitScanDeferred(r.model.device, plan, e);
+         e.barrier();
+         for (0..r.gdn.budget.layers) |gi| try r.gdn.commitPublish(gi, plan, e);
+         // the attention moves touch only their caches, maps and lanes: they run beside the GDN publish
+@@ -430,6 +431,7 @@ pub const Runner = struct {
+         defer pool.pop();
+         const cb = r.model.queue.commandBuffer();
+         const e = cb.compute(.serial);
++        r.gdn.pending = null; // the state it would replay is cleared
+         try r.gdn.clearSlot(slot, e);
+         e.end();
+         cb.commit();
+diff --git a/Vendor/TensorFold/zig/src/families/qwen27/dflash/generation.zig b/Vendor/TensorFold/zig/src/families/qwen27/dflash/generation.zig
+index c0e077d..5165556 100644
+--- a/Vendor/TensorFold/zig/src/families/qwen27/dflash/generation.zig
++++ b/Vendor/TensorFold/zig/src/families/qwen27/dflash/generation.zig
+@@ -47,6 +47,7 @@ pub const Generation = struct {
+         if (g.keep) |cb| {
+             cb.wait();
+             cb.release();
++            g.runner.gdn.stashPending();
+         }
+         g.commit.deinit();
+         if (g.picked) |f| f.deinit();
+@@ -150,6 +151,7 @@ pub const Generation = struct {
+         g.keep = null;
+         defer cb.release();
+         cb.wait();
++        g.runner.gdn.stashPending();
+         if (gpuFailed(cb, "a draft round's keep")) {
+             g.runner.failed = true;
+             return error.DraftKeepGpuFailure;
+diff --git a/Vendor/TensorFold/zig/src/families/qwen27/gdn_hook.zig b/Vendor/TensorFold/zig/src/families/qwen27/gdn_hook.zig
+index 9a69d03..e182c1a 100644
+--- a/Vendor/TensorFold/zig/src/families/qwen27/gdn_hook.zig
++++ b/Vendor/TensorFold/zig/src/families/qwen27/gdn_hook.zig
+@@ -25,11 +25,13 @@ pub const Hook = struct {
+         if (block >= hook.linear_index.len or hook.linear_index[block] >= hook.pool.budget.layers or rows != hook.plan.parents.len) return error.BadGdnHook;
+         const layer = hook.linear_index[block];
+         const sums = @import("forward.zig").sums(frame, .sums, rows);
++        try hook.pool.replayPending(layer, e); // its own layer's deferred replay, if no scan before ran it
+         try hook.quant.quant(e, weight.qkv, frame.get(.input), sums, frame.get(.dims), try hook.pool.projected(layer), rows);
+         var z = Late{ .quant = hook.quant, .zba = weight.zba, .frame = frame, .sums = sums, .rows = rows, .tiles = zTiles(weight.zba, frame, hook.quant.prompt) };
+         if (z.tiles > 0) try hook.quant.quantRange(e, weight.zba, frame.get(.input), sums, frame.get(.dims), frame.get(.mixed), rows, .{ z.tiles, weight.zba.n / 32 - z.tiles }) else try hook.quant.quant(e, weight.zba, frame.get(.input), sums, frame.get(.dims), frame.get(.mixed), rows);
+         e.barrier();
+-        const beside: ?gdn.Beside = if (z.tiles > 0) .{ .ptr = &z, .encode = Late.encode } else null;
++        var both = Both{ .z = if (z.tiles > 0) &z else null, .pool = hook.pool, .next = layer + 1 };
++        const beside: ?gdn.Beside = if (z.tiles > 0 or hook.pool.pending != null) .{ .ptr = &both, .encode = Both.encode } else null;
+         // the gate writes the out projection's group sums into `.sums` once qkv and zba have read the norm's
+         var gated = try refs(weight, frame);
+         const xs = frame.get(.sums);
+@@ -78,3 +80,16 @@ fn refs(weight: Weights.Gdn, frame: *Frame) !pool_gpu.Refs {
+ fn devicePlan(plan: Plan, frame: *Frame) pool_gpu.DevicePlan {
+     return .{ .host = plan, .metadata = .{ .parents = frame.get(.parents), .windows = frame.get(.windows), .row_slots = frame.get(.row_slots), .segments = frame.get(.segments), .keeps = frame.get(.keeps), .kept_rows = frame.get(.kept_rows), .slot_steps = frame.get(.slot_steps) } };
+ }
++
++/// What runs beside a layer's scan: its z tiles (prompt passes) and the next GDN layer's deferred replay, which reads and
++/// writes only that layer's state and logged rows, none of which this layer's kernels touch.
++const Both = struct {
++    z: ?*Late,
++    pool: *Pool,
++    next: usize,
++    fn encode(ptr: *anyopaque, e: metal.ComputeEncoder) anyerror!void {
++        const b: *Both = @ptrCast(@alignCast(ptr));
++        if (b.z) |z| try Late.encode(z, e);
++        try b.pool.replayPending(b.next, e);
++    }
++};
+diff --git a/Vendor/TensorFold/zig/src/families/qwen27/gdn_pool_gpu.zig b/Vendor/TensorFold/zig/src/families/qwen27/gdn_pool_gpu.zig
+index 25c0fd4..74f7f9c 100644
+--- a/Vendor/TensorFold/zig/src/families/qwen27/gdn_pool_gpu.zig
++++ b/Vendor/TensorFold/zig/src/families/qwen27/gdn_pool_gpu.zig
+@@ -64,6 +64,11 @@ pub const Pool = struct {
+     profiler: ?*profile.Trace = null,
+     tree_mode: gdn.TreeMode = .auto,
+     residency: ?metal.ResidencySet.Follow = null,
++    /// A device keep's replay, deferred into the next forward: each layer's runs beside the scan of the GDN layer before
++    /// it (or at the top of its own layer), where the scan leaves DRAM idle, instead of beside the drafter.
++    pending: ?Pending = null,
++    /// The deferred replay's segments, keeps and kept rows, copied from the frame once the keep has written them.
++    pending_words: ?metal.Buffer = null,
+ 
+     pub fn setResident(pool: *Pool, hook: ?metal.ResidencySet.Follow) void {
+         if (pool.residency) |f| metal.resident.fields.apply(pool, f, false);
+@@ -95,6 +100,7 @@ pub const Pool = struct {
+     }
+ 
+     pub fn deinit(pool: *Pool) void {
++        if (pool.pending_words) |b| b.deinit();
+         pool.setResident(null);
+         pool.releaseBefore();
+         pool.kernels.deinit();
+@@ -234,6 +240,67 @@ pub const Pool = struct {
+         e.barrier();
+     }
+ 
++    /// commitScan's conv window only, with the replay left to the next forward (replayPending); every layer's, once.
++    pub fn commitScanDeferred(pool: *Pool, device: metal.Device, plan: DevicePlan, e: metal.ComputeEncoder) !void {
++        try @import("gdn_pool.zig").validatePlan(pool.budget.shape, pool.budget.slots, pool.budget.rows, plan.host);
++        if (!inPlace(plan.host)) return error.GdnSlotMoves;
++        if (pool.pending != null) return error.GdnReplayPending;
++        const kinds = abi.WeightKinds{ .conv = .bf16, .a_log = .bf16, .dt = .bf16, .norm = .bf16 };
++        var p = try pool.budget.shape.params(plan.host.parents.len, pool.budget.slots, kinds);
++        p.advance = @intFromBool(pool.advances(plan.host));
++        if (p.advance != 0) {
++            for (0..pool.budget.layers) |gi| try pool.commitScan(gi, plan, e);
++            return;
++        }
++        if (pool.pending_words == null) pool.pending_words = try device.buffer(3 * pending_stride, metal.ResourceOptions.shared | metal.ResourceOptions.untracked);
++        if (std.mem.sliceAsBytes(plan.host.segments).len > pending_stride or std.mem.sliceAsBytes(plan.host.keeps).len > pending_stride or plan.host.parents.len * 4 > pending_stride) return error.GdnReplayTooLarge;
++        pool.pending = .{ .p = p, .keeps = plan.host.keeps.len, .segments = plan.host.segments.len, .kept_rows = plan.host.parents.len, .metadata = plan.metadata }; // the keep's GPU pass writes up to every row
++        const m = plan.metadata;
++        for (0..pool.budget.layers) |layer| {
++            const history = try pool.layerSpan(.history, layer);
++            const next_history = try pool.layerSpan(.next_history, layer);
++            e.setPipeline(pool.kernels.pipelines.conv_commit);
++            gdn.bind(e, .{ history, try pool.layerSpan(.qkv, layer) }, 0);
++            e.setBuffer(m.kept_rows.buffer, m.kept_rows.offset, 2);
++            e.setBuffer(m.keeps.buffer, m.keeps.offset, 3);
++            e.setBuffer(m.windows.buffer, m.windows.offset, 4);
++            e.setValue(p, 5);
++            e.setBuffer(next_history.buffer, next_history.offset, 6);
++            e.dispatchThreads(.{ .width = pool.budget.shape.conv, .height = plan.host.keeps.len }, .{ .width = 256 }); // a word a thread
++        }
++    }
++    /// Once the keep's command buffer has completed: its segments, keeps and kept rows into the pending words, before the
++    /// next forward's uploads rewrite the frame's.
++    pub fn stashPending(pool: *Pool) void {
++        const pd = &(pool.pending orelse return);
++        if (pd.stashed) return;
++        const words = pool.pending_words.?.contents();
++        const m = pd.metadata;
++        @memcpy(words[0..][0 .. pd.segments * @sizeOf(abi.Segment)], m.segments.buffer.contents()[m.segments.offset..][0 .. pd.segments * @sizeOf(abi.Segment)]);
++        @memcpy(words[pending_stride..][0 .. pd.keeps * @sizeOf(abi.Keep)], m.keeps.buffer.contents()[m.keeps.offset..][0 .. pd.keeps * @sizeOf(abi.Keep)]);
++        @memcpy(words[2 * pending_stride ..][0 .. pd.kept_rows * 4], m.kept_rows.buffer.contents()[m.kept_rows.offset..][0 .. pd.kept_rows * 4]);
++        pd.stashed = true;
++    }
++    /// The deferred replay of `layer`, if it has not run: tf_delta_gdn_replay with the keep's own params and words.
++    pub fn replayPending(pool: *Pool, layer: usize, e: metal.ComputeEncoder) !void {
++        const pd = &(pool.pending orelse return);
++        if (layer >= pool.budget.layers or pd.done.isSet(layer)) return;
++        if (!pd.stashed) return error.GdnReplayNotStashed;
++        pd.done.set(layer);
++        const words = pool.pending_words.?;
++        const state = try pool.layerSpan(.state, layer);
++        e.setPipeline(pool.kernels.pipelines.replay);
++        e.setBuffer(words, 0, 9);
++        state.bind(e, 10);
++        gdn.bind(e, .{ try pool.layerSpan(.key, layer), try pool.layerSpan(.value, layer), try pool.layerSpan(.decay, layer), try pool.layerSpan(.mixing, layer), state }, 0);
++        e.setBuffer(words, 2 * pending_stride, 5);
++        e.setBuffer(words, pending_stride, 6);
++        e.setValue(pd.p, 7);
++        e.setBuffer(state.buffer, state.offset, 8);
++        e.dispatchThreads(.{ .width = 32, .height = pd.p.dv, .depth = pd.p.nv * pd.keeps }, .{ .width = 32, .height = 4 });
++        if (pd.done.count() == pool.budget.layers) pool.pending = null;
++    }
++
+     /// A commit's replay, in place, and its conv window, unfenced.
+     pub fn commitScan(pool: *Pool, layer: usize, plan: DevicePlan, e: metal.ComputeEncoder) !void {
+         try @import("gdn_pool.zig").validatePlan(pool.budget.shape, pool.budget.slots, pool.budget.rows, plan.host);
+@@ -407,3 +474,14 @@ fn refSpan(r: Ref, bytes: usize) !gdn.Span {
+     if (r.offset > r.buffer.length() or bytes > r.buffer.length() - r.offset) return error.BadGdnBuffer;
+     return .{ .buffer = r.buffer, .offset = r.offset, .bytes = bytes };
+ }
++
++const pending_stride = 16384;
++pub const Pending = struct {
++    p: abi.Params,
++    keeps: usize,
++    segments: usize,
++    kept_rows: usize,
++    metadata: Metadata,
++    stashed: bool = false,
++    done: std.StaticBitSet(128) = .empty,
++};
+diff --git a/Vendor/TensorFold/zig/src/native/qwen27_lanes.zig b/Vendor/TensorFold/zig/src/native/qwen27_lanes.zig
+index b3cb2eb..d9ec64c 100644
+--- a/Vendor/TensorFold/zig/src/native/qwen27_lanes.zig
++++ b/Vendor/TensorFold/zig/src/native/qwen27_lanes.zig
+@@ -388,6 +388,7 @@ pub const Metal = struct {
+         ended = true;
+         cb.commit();
+         cb.wait();
++        r.gdn.stashPending(); // the keep's metadata, before the next forward's uploads rewrite the frame's
+         if (q.decode_round.gpuFailed(cb, "slot 0's keep")) {
+             r.failed = true;
+             return error.KeepGpuFailure;
